@@ -1333,8 +1333,18 @@ def prepare_forecast_and_weather_data(
                 .fillna(method="bfill")
             )
 
-    # Merge GHI (Global Horizontal Irradiance) from weather forecast if available
-    if input_data_dict["df_weather"] is not None and "ghi" in input_data_dict["df_weather"].columns:
+    # Add GHI if provided explicitly
+    if input_data_dict["params"]["passed_data"].get("ghi_forecast") is not None:
+        df_input_data_dayahead["ghi"] = input_data_dict["params"]["passed_data"]["ghi_forecast"]
+        logger.info(
+            "Using passed ghi_forecast data for optimization input: %s points",
+            len(df_input_data_dayahead["ghi"]),
+        )
+
+    # Otherwise merge GHI (Global Horizontal Irradiance) from weather forecast if available
+    elif (
+        input_data_dict["df_weather"] is not None and "ghi" in input_data_dict["df_weather"].columns
+    ):
         dayahead_index = df_input_data_dayahead.index
         ghi_series = input_data_dict["df_weather"]["ghi"].copy()
 
@@ -1465,6 +1475,7 @@ async def naive_mpc_optim(
 
     """
     logger.info("Performing naive MPC optimization")
+    logger.info("EMHASS hotpatch active: custom ghi_forecast MPC support enabled")
     # Prepare forecast data with costs, prices, outdoor temp, and GHI (with resolution warning)
     df_input_data_dayahead = prepare_forecast_and_weather_data(
         input_data_dict, logger, warn_on_resolution=True

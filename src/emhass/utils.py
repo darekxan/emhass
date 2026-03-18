@@ -1012,6 +1012,7 @@ async def treat_runtimeparams(
             "load_cost_forecast",
             "prod_price_forecast",
             "outdoor_temperature_forecast",
+            "ghi_forecast",
         ]
         forecast_methods = [
             "weather_forecast_method",
@@ -1019,6 +1020,7 @@ async def treat_runtimeparams(
             "load_cost_forecast_method",
             "production_price_forecast_method",
             "outdoor_temperature_forecast_method",
+            "ghi_forecast_method",
         ]
 
         # Loop forecasts, check if value is a list and greater than or equal to forecast_dates
