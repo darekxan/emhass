@@ -19,20 +19,20 @@ You can also install EMHASS using Docker as a container. This can be in the same
 To install first pull the latest image:
 ```bash
 # pull Docker image
-docker pull ghcr.io/davidusb-geek/emhass:latest
+docker pull ghcr.io/darekxan/emhass:latest
 # run Docker image, mounting the dir storing config.json and secrets_emhass.yaml from host
-docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share/ -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/davidusb-geek/emhass:latest
+docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share/ -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/darekxan/emhass:latest
 ```
 
 ```{note} 
 
-*It is not recommended to install the latest EMHASS image with `:latest` *(as you would likely want to control when you update EMHASS version)*. Instead, find the [latest version tag](https://github.com/davidusb-geek/emhass/pkgs/container/emhass) (E.g: `v0.2.1`) and replace `latest`*
+*It is not recommended to install the latest EMHASS image with `:latest` *(as you would likely want to control when you update EMHASS version)*. Instead, find the [latest version tag](https://github.com/darekxan/emhass/pkgs/container/emhass) (E.g: `v0.2.1`) and replace `latest`*
 ```
 
 You can also build your image locally. For this clone this repository, and build the image from the Dockerfile:
 ```bash
 # git clone EMHASS repo
-git clone https://github.com/davidusb-geek/emhass.git
+git clone https://github.com/darekxan/emhass.git
 # move to EMHASS directory 
 cd emhass
 # build Docker image 
@@ -42,7 +42,7 @@ docker build -t emhass-local .
 docker run --rm -it -p 5000:5000 --name emhass-container -v /emhass/share:/share -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml emhass-local
 ```
 
-Before running the docker container, make sure you have a designated folder for emhass on your host device and a `secrets_emhass.yaml` file. You can get a example of the secrets file from [`secrets_emhass(example).yaml`](https://github.com/davidusb-geek/emhass/blob/master/secrets_emhass(example).yaml) file on this repository.
+Before running the docker container, make sure you have a designated folder for emhass on your host device and a `secrets_emhass.yaml` file. You can get a example of the secrets file from [`secrets_emhass(example).yaml`](https://github.com/darekxan/emhass/blob/master/secrets_emhass(example).yaml) file on this repository.
 ```bash
 # cli example of creating an emhass directory and appending a secrets_emhass.yaml file inside
 mkdir ~/emhass
@@ -55,7 +55,7 @@ lat: 45.83
 lon: 6.86
 alt: 4807.8
 EOT
-docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/davidusb-geek/emhass:latest
+docker run --rm -it --restart always  -p 5000:5000 --name emhass-container -v /emhass/share:/share -v /emhass/secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/darekxan/emhass:latest
 ```
 
 ### Docker, things to note 

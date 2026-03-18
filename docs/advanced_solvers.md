@@ -16,7 +16,7 @@ Create a file named `Dockerfile.custom` that extends the official EMHASS image.
 **For Gurobi:**
 
 ```dockerfile
-FROM davidusb-geek/emhass:latest
+FROM ghcr.io/darekxan/emhass:latest
 
 # Install the Gurobi Python interface
 RUN uv pip install gurobipy
@@ -29,7 +29,7 @@ ENV LP_SOLVER=GUROBI
 **For CPLEX:**
 
 ```dockerfile
-FROM davidusb-geek/emhass:latest
+FROM ghcr.io/darekxan/emhass:latest
 
 # Install the CPLEX Python interface
 RUN uv pip install cplex
