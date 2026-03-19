@@ -287,6 +287,7 @@ class Optimization:
                         "heating_demand": cp.Parameter(
                             n, name=f"thermal_battery_heating_demand_{k}"
                         ),
+                        "solar_gains": cp.Parameter(n, name=f"thermal_battery_solar_gains_{k}"),
                         "heatpump_cops": cp.Parameter(n, name=f"thermal_battery_cops_{k}"),
                     }
                     # Initialize with default values
@@ -299,6 +300,7 @@ class Optimization:
                     )
                     self.param_thermal[k]["thermal_losses"].value = np.zeros(n)
                     self.param_thermal[k]["heating_demand"].value = np.zeros(n)
+                    self.param_thermal[k]["solar_gains"].value = np.zeros(n)
                     self.param_thermal[k]["heatpump_cops"].value = np.full(n, 3.0)
 
                     # Thermal inertia support (first-order low-pass filter on heat input)
@@ -390,7 +392,7 @@ class Optimization:
             # Validate binary: accept bool and numeric 0/1, reject everything else
             if isinstance(state, bool):
                 self.param_def_current_state[k].value = float(state)
-            elif isinstance(state, (int, float)) and state in (0, 1, 0.0, 1.0):
+            elif isinstance(state, int | float) and state in (0, 1, 0.0, 1.0):
                 self.param_def_current_state[k].value = float(state)
             else:
                 raise ValueError(
@@ -551,7 +553,7 @@ class Optimization:
                     if internal_gains_factor > 0:
                         internal_gains_forecast = p_load
 
-                    heating_demand = utils.calculate_heating_demand_physics(
+                    heat_balance = utils.calculate_heating_demand_physics_components(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
                         ventilation_rate=hc["ventilation_rate"],
@@ -565,9 +567,14 @@ class Optimization:
                         internal_gains_forecast=internal_gains_forecast,
                         internal_gains_factor=internal_gains_factor,
                     )
-                    params["heating_demand"].value = np.array(heating_demand[:n])
+                    effective_heating_demand = (
+                        heat_balance["heat_loss_kwh"] - heat_balance["internal_gains_kwh"]
+                    )
+                    params["heating_demand"].value = np.array(effective_heating_demand[:n])
+                    params["solar_gains"].value = np.array(heat_balance["solar_gains_kwh"][:n])
                 else:
                     params["heating_demand"].value = np.zeros(n)
+                    params["solar_gains"].value = np.zeros(n)
 
                 self._persist_q_input(k, params, hc)
 
@@ -1443,6 +1450,7 @@ class Optimization:
             heatpump_cops = params["heatpump_cops"]
             thermal_losses = params["thermal_losses"]
             heating_demand = params["heating_demand"]
+            solar_gains = params["solar_gains"]
             min_temps_param = params["min_temps"]
             max_temps_param = params["max_temps"]
 
@@ -1487,7 +1495,7 @@ class Optimization:
                         vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
                     solar_irradiance = vals[:required_len]
 
-                demand = utils.calculate_heating_demand_physics(
+                heat_balance = utils.calculate_heating_demand_physics_components(
                     u_value=hc["u_value"],
                     envelope_area=hc["envelope_area"],
                     ventilation_rate=hc["ventilation_rate"],
@@ -1501,7 +1509,13 @@ class Optimization:
                     internal_gains_forecast=internal_gains_forecast,
                     internal_gains_factor=internal_gains_factor,
                 )
-                params["heating_demand"].value = np.array(demand[:required_len])
+                effective_heating_demand = (
+                    heat_balance["heat_loss_kwh"] - heat_balance["internal_gains_kwh"]
+                )
+                params["heating_demand"].value = np.array(effective_heating_demand[:required_len])
+                params["solar_gains"].value = np.array(
+                    heat_balance["solar_gains_kwh"][:required_len]
+                )
 
                 gains_info = []
                 if solar_irradiance is not None:
@@ -1533,6 +1547,7 @@ class Optimization:
                     optimization_time_step=int(self.freq.total_seconds() / 60),
                 )
                 params["heating_demand"].value = np.array(demand[:required_len])
+                params["solar_gains"].value = np.zeros(required_len)
 
             # Set min/max temperature parameters
             params["min_temps"].value = self._pad_temp_array(
@@ -1565,6 +1580,7 @@ class Optimization:
                     base_loss=loss,
                 )[:required_len]
             )
+            solar_gain_arr = np.zeros(required_len)
 
             # Compute heating demand (simplified fallback)
             if all(
@@ -1572,7 +1588,18 @@ class Optimization:
                 for key in ["u_value", "envelope_area", "ventilation_rate", "heated_volume"]
             ):
                 indoor_target_temp = hc.get("indoor_target_temperature", 20.0)
-                demand = utils.calculate_heating_demand_physics(
+                window_area = hc.get("window_area", None)
+                shgc = hc.get("shgc", 0.6)
+                internal_gains_factor = hc.get("internal_gains_factor", 0.0)
+                internal_gains_forecast = p_load if internal_gains_factor > 0 else None
+                solar_irradiance = None
+                if "ghi" in data_opt.columns and window_area is not None:
+                    vals = data_opt["ghi"].values
+                    if len(vals) < required_len:
+                        vals = np.concatenate((vals, np.zeros(required_len - len(vals))))
+                    solar_irradiance = vals[:required_len]
+
+                heat_balance = utils.calculate_heating_demand_physics_components(
                     u_value=hc["u_value"],
                     envelope_area=hc["envelope_area"],
                     ventilation_rate=hc["ventilation_rate"],
@@ -1580,7 +1607,14 @@ class Optimization:
                     indoor_target_temperature=indoor_target_temp,
                     outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
                     optimization_time_step=int(self.freq.total_seconds() / 60),
+                    solar_irradiance_forecast=solar_irradiance,
+                    window_area=window_area,
+                    shgc=shgc,
+                    internal_gains_forecast=internal_gains_forecast,
+                    internal_gains_factor=internal_gains_factor,
                 )
+                demand = heat_balance["heat_loss_kwh"] - heat_balance["internal_gains_kwh"]
+                solar_gain_arr = np.array(heat_balance["solar_gains_kwh"][:required_len])
             else:
                 demand = utils.calculate_heating_demand(
                     specific_heating_demand=hc["specific_heating_demand"],
@@ -1591,6 +1625,7 @@ class Optimization:
                     optimization_time_step=int(self.freq.total_seconds() / 60),
                 )
             heating_demand = np.array(demand[:required_len])
+            solar_gains = solar_gain_arr
             min_temps_param = None
             max_temps_param = None
 
@@ -1629,22 +1664,25 @@ class Optimization:
             # Q_input variable: filtered heat energy per timestep (kWh)
             q_input = cp.Variable(required_len, nonneg=True, name=f"q_input_{k}")
 
-            # Initialize Q_input[0] from CVXPY Parameter (enables warm-start updates)
+            # Raw heat input: COP * P_hp / 1000 * dt (kWh thermal per timestep)
+            raw_heat = cp.multiply(heatpump_cops, p_deferrable) / 1000 * self.time_step
+
+            # Initialize the first filtered timestep from the previous inertia state.
+            # On a fresh solve q_input_start defaults to 0.0, while cache hits or explicit
+            # q_input_initial overrides carry the previous state forward.
             params = self.param_thermal.get(k, {})
             q_input_start = params.get("q_input_start", 0.0)
-            constraints.append(q_input[0] == q_input_start)
+            constraints.append(q_input[0] == q_input_start + alpha * (raw_heat[0] - q_input_start))
 
-            # Raw heat input: COP * P_hp / 1000 * dt (kWh thermal per timestep)
-            raw_heat = cp.multiply(heatpump_cops[:-1], p_deferrable[:-1]) / 1000 * self.time_step
-
-            # First-order low-pass filter
-            constraints.append(q_input[1:] == q_input[:-1] + alpha * (raw_heat - q_input[:-1]))
+            # First-order low-pass filter for subsequent timesteps.
+            constraints.append(q_input[1:] == q_input[:-1] + alpha * (raw_heat[1:] - q_input[:-1]))
 
             # Temperature uses filtered Q_input instead of raw heat
             constraints.append(
                 predicted_temp_thermal[1:]
                 == predicted_temp_thermal[:-1]
-                + conversion * (q_input[:-1] - heating_demand[:-1] - thermal_losses[:-1])
+                + conversion
+                * (q_input[:-1] + solar_gains[:-1] - heating_demand[:-1] - thermal_losses[:-1])
             )
 
             # Store reference for auto-persistence on cache hit
@@ -1659,6 +1697,7 @@ class Optimization:
                 + conversion
                 * (
                     (cp.multiply(heatpump_cops[:-1], p_deferrable[:-1]) / 1000 * self.time_step)
+                    + solar_gains[:-1]
                     - heating_demand[:-1]
                     - thermal_losses[:-1]
                 )
@@ -1695,7 +1734,10 @@ class Optimization:
             if k in self.param_thermal
             else heating_demand
         )
-        return predicted_temp_thermal, heating_demand_arr, q_input
+        solar_gains_arr = (
+            self.param_thermal[k]["solar_gains"].value if k in self.param_thermal else solar_gains
+        )
+        return predicted_temp_thermal, heating_demand_arr, q_input, solar_gains_arr
 
     def _add_deferrable_load_constraints(
         self,
@@ -1718,6 +1760,7 @@ class Optimization:
         predicted_temps = {}
         heating_demands = {}
         q_inputs = {}
+        solar_gains = {}
         penalty_terms_total = 0
         n = self.num_timesteps
 
@@ -1798,11 +1841,12 @@ class Optimization:
                 and len(self.optim_conf["def_load_config"]) > k
                 and "thermal_battery" in self.optim_conf["def_load_config"][k]
             ):
-                pred_temp, heat_demand, q_input_var = self._add_thermal_battery_constraints(
-                    constraints, k, data_opt, p_load
+                pred_temp, heat_demand, q_input_var, solar_gain_arr = (
+                    self._add_thermal_battery_constraints(constraints, k, data_opt, p_load)
                 )
                 predicted_temps[k] = pred_temp
                 heating_demands[k] = heat_demand
+                solar_gains[k] = solar_gain_arr
                 if q_input_var is not None:
                     q_inputs[k] = q_input_var
 
@@ -1997,7 +2041,7 @@ class Optimization:
                 constraints.append(p_deferrable[k] >= 0)
                 constraints.append(p_deferrable[k] <= M)
 
-        return predicted_temps, heating_demands, penalty_terms_total, q_inputs
+        return predicted_temps, heating_demands, penalty_terms_total, q_inputs, solar_gains
 
     def _build_results_dataframe(
         self,
@@ -2011,6 +2055,7 @@ class Optimization:
         heating_demands,
         debug,
         q_inputs=None,
+        solar_gains=None,
     ):
         """Build the final results DataFrame (Vectorized extraction)."""
         opt_tp = pd.DataFrame(index=data_opt.index)
@@ -2146,6 +2191,10 @@ class Optimization:
 
         for k, heat_demand in heating_demands.items():
             opt_tp[f"heating_demand_heater{k}"] = heat_demand
+
+        if solar_gains:
+            for k, solar_gain in solar_gains.items():
+                opt_tp[f"solar_gain_heater{k}"] = np.round(solar_gain, 4)
 
         if q_inputs:
             for k, q_input_var in q_inputs.items():
@@ -2324,6 +2373,7 @@ class Optimization:
             for k, params in self.param_thermal.items():
                 if params["type"] == "thermal_battery":
                     self.heating_demands[k] = params["heating_demand"].value
+                    self.solar_gains[k] = params["solar_gains"].value
 
         # Update Energy Constraint Parameters for Deferrable Loads
         # These control the Big-M relaxation of energy/timestep constraints
@@ -2437,18 +2487,22 @@ class Optimization:
                 )
 
             # Deferrable Loads
-            self.predicted_temps, self.heating_demands, penalty_terms_total, self.q_inputs = (
-                self._add_deferrable_load_constraints(
-                    constraints,
-                    data_opt,
-                    def_total_hours,
-                    def_total_timestep,
-                    def_start_timestep,
-                    def_end_timestep,
-                    def_init_temp,
-                    min_power_of_deferrable_loads,
-                    p_load,
-                )
+            (
+                self.predicted_temps,
+                self.heating_demands,
+                penalty_terms_total,
+                self.q_inputs,
+                self.solar_gains,
+            ) = self._add_deferrable_load_constraints(
+                constraints,
+                data_opt,
+                def_total_hours,
+                def_total_timestep,
+                def_start_timestep,
+                def_end_timestep,
+                def_init_temp,
+                min_power_of_deferrable_loads,
+                p_load,
             )
 
             # Build Objective
@@ -2579,18 +2633,22 @@ class Optimization:
                 )
 
             # Re-call deferrable load constraints (Skipping binary logic due to config change)
-            self.predicted_temps, self.heating_demands, penalty_terms_total, self.q_inputs = (
-                self._add_deferrable_load_constraints(
-                    constraints_relaxed,
-                    data_opt,
-                    def_total_hours,
-                    def_total_timestep,
-                    def_start_timestep,
-                    def_end_timestep,
-                    def_init_temp,
-                    min_power_of_deferrable_loads,
-                    p_load,
-                )
+            (
+                self.predicted_temps,
+                self.heating_demands,
+                penalty_terms_total,
+                self.q_inputs,
+                self.solar_gains,
+            ) = self._add_deferrable_load_constraints(
+                constraints_relaxed,
+                data_opt,
+                def_total_hours,
+                def_total_timestep,
+                def_start_timestep,
+                def_end_timestep,
+                def_init_temp,
+                min_power_of_deferrable_loads,
+                p_load,
             )
 
             # Re-build Objective
@@ -2659,6 +2717,7 @@ class Optimization:
             self.heating_demands,
             debug,
             q_inputs=self.q_inputs,
+            solar_gains=self.solar_gains,
         )
 
     def perform_perfect_forecast_optim(

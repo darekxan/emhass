@@ -1964,6 +1964,12 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
         # Verify heat pump behavior is reasonable
         total_heat_pump_energy = opt_res["P_deferrable0"].sum()
+        self.assertIn("solar_gain_heater0", opt_res.columns)
+        self.assertGreater(
+            opt_res["solar_gain_heater0"].sum(),
+            0.0,
+            "Solar gain result column should contain positive gains during sunny periods",
+        )
         # Note: Heat pump may run zero energy if solar gains completely offset heating needs
         # and thermal battery stays within temperature bounds. This is valid optimizer behavior.
         self.assertGreaterEqual(
@@ -1977,29 +1983,57 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             print(f"Total heat pump energy with solar gains: {total_heat_pump_energy:.3f} kW")
 
         # The key validation is that the optimization completes successfully with solar gains
+
+    def test_thermal_battery_solar_gains_can_raise_predicted_temperature(self):
+        """Passive solar gains should directly raise thermal battery predicted temperature."""
+        horizon = len(self.df_input_data_dayahead)
+        outdoor_temps = [18.0] * horizon
+        ghi = [0.0] * horizon
+        for i in range(horizon):
+            hour_of_day = (i % 48) / 2
+            if 8 <= hour_of_day <= 16:
+                ghi[i] = 700.0 * np.sin((hour_of_day - 8) * np.pi / 8)
+
+        base_config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 20.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [15.0] * horizon,
+            "max_temperatures": [35.0] * horizon,
+            "u_value": 0.35,
+            "envelope_area": 320.0,
+            "ventilation_rate": 0.35,
+            "heated_volume": 240.0,
+        }
+
+        opt_res_no_solar = self.run_thermal_battery_optimization(
+            base_config.copy(), outdoor_temps=outdoor_temps
+        )
+
+        solar_config = base_config.copy()
+        solar_config["window_area"] = 50.0
+        solar_config["shgc"] = 0.7
+        opt_res_solar = self.run_thermal_battery_optimization(
+            solar_config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        self.assertIn("solar_gain_heater0", opt_res_solar.columns)
+        self.assertGreater(opt_res_solar["solar_gain_heater0"].max(), 0.0)
+        self.assertGreater(
+            opt_res_solar["predicted_temp_heater0"].max(),
+            opt_res_no_solar["predicted_temp_heater0"].max() + 0.1,
+            "Solar gains should raise predicted temperature above the no-solar case",
+        )
+        self.assertGreater(
+            opt_res_solar["predicted_temp_heater0"].iloc[-1],
+            opt_res_no_solar["predicted_temp_heater0"].iloc[-1],
+            "Solar gains should leave the thermal battery warmer by the end of the horizon",
+        )
         # enabled. The INFO log "Using physics-based heating demand with solar gains" confirms
         # the feature is working. The optimizer may choose not to heat if solar gains fully
         # offset heating demand and the thermal battery remains within temperature bounds.
-
-        # NEW: Verify solar gains actually reduce heating demand
-        # Compare average heating power during sunny periods vs night periods
-        heating_power = opt_res["P_deferrable0"].values
-        total_heat_pump_energy = heating_power.sum()
-
-        # Calculate average heating during sunny and night periods
-        if sunny_hours.sum() > 0 and night_hours.sum() > 0 and total_heat_pump_energy > 0:
-            avg_heating_sunny = heating_power[sunny_hours].mean()
-            avg_heating_night = heating_power[night_hours].mean()
-
-            # During sunny periods, solar gains should reduce the need for active heating
-            # Therefore, average heating power during sunny periods should be less than or equal
-            # to night periods (assuming outdoor temps are similar due to the sin pattern)
-            self.assertLessEqual(
-                avg_heating_sunny,
-                avg_heating_night,
-                f"Solar gains should reduce heating demand during sunny periods. "
-                f"Sunny period avg: {avg_heating_sunny:.3f} kW, Night avg: {avg_heating_night:.3f} kW",
-            )
 
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.

@@ -360,9 +360,47 @@ def calculate_heating_demand_physics(
     """
     Calculate heating demand per timestep based on building physics heat loss model.
 
+    This wrapper preserves the historical return type while delegating the actual
+    heat-balance decomposition to
+    [`calculate_heating_demand_physics_components()`](src/emhass/utils.py:521).
+    """
+    balance = calculate_heating_demand_physics_components(
+        u_value=u_value,
+        envelope_area=envelope_area,
+        ventilation_rate=ventilation_rate,
+        heated_volume=heated_volume,
+        indoor_target_temperature=indoor_target_temperature,
+        outdoor_temperature_forecast=outdoor_temperature_forecast,
+        optimization_time_step=optimization_time_step,
+        solar_irradiance_forecast=solar_irradiance_forecast,
+        window_area=window_area,
+        shgc=shgc,
+        internal_gains_forecast=internal_gains_forecast,
+        internal_gains_factor=internal_gains_factor,
+    )
+    return balance["heating_demand_kwh"]
+
+
+def calculate_heating_demand_physics_components(
+    u_value: float,
+    envelope_area: float,
+    ventilation_rate: float,
+    heated_volume: float,
+    indoor_target_temperature: float,
+    outdoor_temperature_forecast: np.ndarray | pd.Series,
+    optimization_time_step: int,
+    solar_irradiance_forecast: np.ndarray | pd.Series | None = None,
+    window_area: float | None = None,
+    shgc: float = 0.6,
+    internal_gains_forecast: np.ndarray | pd.Series | None = None,
+    internal_gains_factor: float = 0.0,
+) -> dict[str, np.ndarray]:
+    """
+    Calculate physics-based heating balance components per timestep.
+
     More accurate than HDD method as it directly calculates transmission and ventilation
     losses based on building thermal properties. Optionally accounts for solar gains
-    through windows to reduce heating demand.
+    through windows and internal gains from electrical loads.
 
     :param u_value: Overall thermal transmittance (U-value) in W/(m²·K). Typical values:
         - 0.2-0.3: Well-insulated modern building
@@ -409,13 +447,15 @@ def calculate_heating_demand_physics(
         - 1.0: All electrical energy becomes internal heat (theoretical maximum)
         Default: 0.0
     :type internal_gains_factor: float, optional
-    :return: Array of heating demand values (kWh) per timestep
-    :rtype: np.ndarray
+    :return: Dictionary containing component arrays in kWh per timestep:
+        `heat_loss_kwh`, `solar_gains_kwh`, `internal_gains_kwh`,
+        and `heating_demand_kwh`.
+    :rtype: dict[str, np.ndarray]
 
     Example:
         >>> outdoor_temps = np.array([5, 8, 12, 15])
         >>> ghi = np.array([0, 100, 400, 600])  # W/m²
-        >>> demand = calculate_heating_demand_physics(
+        >>> balance = calculate_heating_demand_physics_components(
         ...     u_value=0.3,
         ...     envelope_area=400,
         ...     ventilation_rate=0.5,
@@ -427,6 +467,7 @@ def calculate_heating_demand_physics(
         ...     window_area=50,
         ...     shgc=0.6
         ... )
+        >>> demand = balance["heating_demand_kwh"]
     """
 
     # Convert outdoor temperature forecast to numpy array if pandas Series
@@ -451,8 +492,10 @@ def calculate_heating_demand_physics(
         ventilation_rate * heated_volume * air_density * air_heat_capacity * temp_diff / 3600.0
     )
 
-    # Total heat loss in kW
+    # Total heat loss in kW before gains
     total_loss_kw = transmission_loss_kw + ventilation_loss_kw
+
+    solar_gains_kw = np.zeros_like(total_loss_kw)
 
     # Calculate solar gains if irradiance and window area are provided
     if solar_irradiance_forecast is not None and window_area is not None:
@@ -462,19 +505,33 @@ def calculate_heating_demand_physics(
             if isinstance(solar_irradiance_forecast, pd.Series)
             else np.asarray(solar_irradiance_forecast)
         )
+        solar_irradiance = np.asarray(solar_irradiance).reshape(-1)
+        if len(solar_irradiance) != len(outdoor_temps):
+            raise ValueError(
+                f"solar_irradiance_forecast length ({len(solar_irradiance)}) must match "
+                f"outdoor_temperature_forecast length ({len(outdoor_temps)})"
+            )
 
-        # Solar gains: Q_solar = window_area * SHGC * GHI (W to kW)
-        # GHI is in W/m², so multiply by window_area (m²) gives W, then divide by 1000 for kW
-        solar_gains_kw = window_area * shgc * solar_irradiance / 1000.0
-
-        # Subtract solar gains from heat loss (but never go negative)
-        total_loss_kw = np.maximum(total_loss_kw - solar_gains_kw, 0.0)
+        # Solar gains: use a conservative projection from horizontal GHI to effective
+        # heat through building windows.
+        #
+        # The forecast input is GHI on a horizontal plane, while windows are typically
+        # vertical and subject to orientation, frame, incidence-angle and shading losses.
+        # Using raw GHI directly tends to overestimate passive gains for thermal-battery
+        # control and can make strict comfort-bounded MPC cases unrealistically overheat.
+        #
+        # A fixed projection factor keeps the model simple while avoiding raw-GHI
+        # overestimation.
+        window_projection_factor = 0.3
+        solar_gains_kw = window_area * shgc * solar_irradiance * window_projection_factor / 1000.0
 
     # Validate internal_gains_factor is in expected range [0, 1]
     if internal_gains_factor < 0 or internal_gains_factor > 1:
         raise ValueError(
             f"internal_gains_factor must be between 0 and 1, got {internal_gains_factor}"
         )
+
+    internal_gains_kw = np.zeros_like(total_loss_kw)
 
     # Calculate internal gains from electrical load if provided and applicable
     if internal_gains_forecast is not None and internal_gains_factor > 0:
@@ -512,12 +569,16 @@ def calculate_heating_demand_physics(
         # load_power is in W, convert to kW; factor is dimensionless (0-1)
         internal_gains_kw = internal_gains * internal_gains_factor / W_TO_KW
 
-        # Subtract internal gains from heat loss (but never go negative)
-        total_loss_kw = np.maximum(total_loss_kw - internal_gains_kw, 0.0)
+    net_heating_demand_kw = np.maximum(total_loss_kw - solar_gains_kw - internal_gains_kw, 0.0)
 
     # Convert to kWh for the timestep
     hours_per_timestep = optimization_time_step / 60.0
-    return total_loss_kw * hours_per_timestep
+    return {
+        "heat_loss_kwh": total_loss_kw * hours_per_timestep,
+        "solar_gains_kwh": solar_gains_kw * hours_per_timestep,
+        "internal_gains_kwh": internal_gains_kw * hours_per_timestep,
+        "heating_demand_kwh": net_heating_demand_kw * hours_per_timestep,
+    }
 
 
 def update_params_with_ha_config(
@@ -645,6 +706,7 @@ async def treat_runtimeparams(
     custom_deferrable_forecast_id = []
     custom_predicted_temperature_id = []
     custom_heating_demand_id = []
+    custom_solar_gain_id = []
     for k in range(params["optim_conf"]["number_of_deferrable_loads"]):
         custom_deferrable_forecast_id.append(
             {
@@ -668,6 +730,14 @@ async def treat_runtimeparams(
                 "device_class": "energy",
                 "unit_of_measurement": "kWh",
                 "friendly_name": f"Heating demand {k}",
+            }
+        )
+        custom_solar_gain_id.append(
+            {
+                "entity_id": f"sensor.solar_gain{k}",
+                "device_class": "energy",
+                "unit_of_measurement": "kWh",
+                "friendly_name": f"Solar gain {k}",
             }
         )
     default_passed_dict = {
@@ -740,6 +810,7 @@ async def treat_runtimeparams(
         "custom_deferrable_forecast_id": custom_deferrable_forecast_id,
         "custom_predicted_temperature_id": custom_predicted_temperature_id,
         "custom_heating_demand_id": custom_heating_demand_id,
+        "custom_solar_gain_id": custom_solar_gain_id,
         "publish_prefix": "",
     }
     if "passed_data" in params.keys():
@@ -928,33 +999,45 @@ async def treat_runtimeparams(
             else:
                 prediction_horizon = runtimeparams["prediction_horizon"]
             params["passed_data"]["prediction_horizon"] = prediction_horizon
+            battery_soc_min = params["plant_conf"]["battery_minimum_state_of_charge"]
+            battery_soc_max = params["plant_conf"]["battery_maximum_state_of_charge"]
+
+            if "soc_min" in runtimeparams.keys():
+                battery_soc_min = runtimeparams["soc_min"]
+                params["plant_conf"]["battery_minimum_state_of_charge"] = battery_soc_min
+
+            if "battery_target_state_of_charge" in runtimeparams.keys():
+                params["plant_conf"]["battery_target_state_of_charge"] = runtimeparams[
+                    "battery_target_state_of_charge"
+                ]
+
             if "soc_init" not in runtimeparams.keys():
                 soc_init = params["plant_conf"]["battery_target_state_of_charge"]
             else:
                 soc_init = runtimeparams["soc_init"]
-            if soc_init < params["plant_conf"]["battery_minimum_state_of_charge"]:
+            if soc_init < battery_soc_min:
                 logger.warning(
-                    f"Passed soc_init={soc_init} is lower than soc_min={params['plant_conf']['battery_minimum_state_of_charge']}, keeping real initial SOC for optimization recovery"
+                    f"Passed soc_init={soc_init} is lower than soc_min={battery_soc_min}, keeping real initial SOC for optimization recovery"
                 )
-            if soc_init > params["plant_conf"]["battery_maximum_state_of_charge"]:
+            if soc_init > battery_soc_max:
                 logger.warning(
-                    f"Passed soc_init={soc_init} is greater than soc_max={params['plant_conf']['battery_maximum_state_of_charge']}, keeping real initial SOC for optimization recovery"
+                    f"Passed soc_init={soc_init} is greater than soc_max={battery_soc_max}, keeping real initial SOC for optimization recovery"
                 )
             params["passed_data"]["soc_init"] = soc_init
             if "soc_final" not in runtimeparams.keys():
                 soc_final = params["plant_conf"]["battery_target_state_of_charge"]
             else:
                 soc_final = runtimeparams["soc_final"]
-            if soc_final < params["plant_conf"]["battery_minimum_state_of_charge"]:
+            if soc_final < battery_soc_min:
                 logger.warning(
-                    f"Passed soc_final={soc_final} is lower than soc_min={params['plant_conf']['battery_minimum_state_of_charge']}, setting soc_final=soc_min"
+                    f"Passed soc_final={soc_final} is lower than soc_min={battery_soc_min}, setting soc_final=soc_min"
                 )
-                soc_final = params["plant_conf"]["battery_minimum_state_of_charge"]
-            if soc_final > params["plant_conf"]["battery_maximum_state_of_charge"]:
+                soc_final = battery_soc_min
+            if soc_final > battery_soc_max:
                 logger.warning(
-                    f"Passed soc_final={soc_final} is greater than soc_max={params['plant_conf']['battery_maximum_state_of_charge']}, setting soc_final=soc_max"
+                    f"Passed soc_final={soc_final} is greater than soc_max={battery_soc_max}, setting soc_final=soc_max"
                 )
-                soc_final = params["plant_conf"]["battery_maximum_state_of_charge"]
+                soc_final = battery_soc_max
             params["passed_data"]["soc_final"] = soc_final
             if "operating_timesteps_of_each_deferrable_load" in runtimeparams.keys():
                 params["passed_data"]["operating_timesteps_of_each_deferrable_load"] = (
@@ -1314,6 +1397,8 @@ async def treat_runtimeparams(
             params["passed_data"]["custom_heating_demand_id"] = runtimeparams[
                 "custom_heating_demand_id"
             ]
+        if "custom_solar_gain_id" in runtimeparams.keys():
+            params["passed_data"]["custom_solar_gain_id"] = runtimeparams["custom_solar_gain_id"]
 
     # split config categories from params
     retrieve_hass_conf = params["retrieve_hass_conf"]

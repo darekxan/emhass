@@ -1765,6 +1765,45 @@ class TestHeatingDemand(unittest.TestCase):
             "Solar irradiance should reduce total heating demand during sunny periods",
         )
 
+    def test_calculate_heating_demand_physics_components_exposes_solar_gains(self):
+        """Physics helper should expose passive solar gains separately from residual demand."""
+        indoor_temp = 20.0
+        outdoor_temps = np.array([18.0, 18.0, 18.0, 18.0])
+        solar_irradiance = np.array([0.0, 400.0, 700.0, 0.0])
+
+        balance = utils.calculate_heating_demand_physics_components(
+            u_value=0.35,
+            envelope_area=380.0,
+            ventilation_rate=0.4,
+            heated_volume=240.0,
+            indoor_target_temperature=indoor_temp,
+            outdoor_temperature_forecast=outdoor_temps,
+            optimization_time_step=60,
+            solar_irradiance_forecast=solar_irradiance,
+            window_area=45.0,
+            shgc=0.65,
+        )
+
+        self.assertIn("heating_demand_kwh", balance)
+        self.assertIn("solar_gains_kwh", balance)
+        self.assertTrue(np.all(balance["solar_gains_kwh"] >= 0.0))
+        self.assertGreater(balance["solar_gains_kwh"][1], 0.0)
+        self.assertGreater(balance["solar_gains_kwh"][2], balance["heating_demand_kwh"][2])
+
+        legacy_demand = utils.calculate_heating_demand_physics(
+            u_value=0.35,
+            envelope_area=380.0,
+            ventilation_rate=0.4,
+            heated_volume=240.0,
+            indoor_target_temperature=indoor_temp,
+            outdoor_temperature_forecast=outdoor_temps,
+            optimization_time_step=60,
+            solar_irradiance_forecast=solar_irradiance,
+            window_area=45.0,
+            shgc=0.65,
+        )
+        np.testing.assert_allclose(legacy_demand, balance["heating_demand_kwh"])
+
     def test_calculate_heating_demand_physics_scaling_with_timestep(self):
         """Sanity check: total demand scales appropriately with optimization_time_step."""
         indoor_temp = 21.0

@@ -2193,6 +2193,7 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         return cols
     custom_temp = ctx.params["passed_data"]["custom_predicted_temperature_id"]
     custom_heat = ctx.params["passed_data"].get("custom_heating_demand_id")
+    custom_solar = ctx.params["passed_data"].get("custom_solar_gain_id")
     def_load_config = ctx.optim_conf.get("def_load_config", [])
     if not isinstance(def_load_config, list):
         def_load_config = []
@@ -2228,6 +2229,19 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         )
         if col_h:
             cols.append(col_h)
+        col_s = await _publish_thermal_variable(
+            ctx.rh,
+            opt_res_latest,
+            ctx.idx,
+            k,
+            custom_solar,
+            "solar_gain_heater",
+            "energy",
+            "energy",
+            ctx.common_kwargs,
+        )
+        if col_s:
+            cols.append(col_s)
     return cols
 
 
