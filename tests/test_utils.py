@@ -1707,7 +1707,7 @@ class TestHeatingDemand(unittest.TestCase):
             )
 
     def test_calculate_heating_demand_physics_with_solar_gains_reduces_demand(self):
-        """Solar gains reduce demand vs. no-solar case, and demand never becomes negative."""
+        """Solar gains reduce demand vs. no-solar case."""
         indoor_temp = 21.0
         outdoor_temps = np.array([0.0, 0.0, 0.0, 0.0])
         optimization_time_step = 60  # minutes
@@ -1744,11 +1744,6 @@ class TestHeatingDemand(unittest.TestCase):
             solar_irradiance_forecast=solar_irradiance,
             window_area=window_area,
             shgc=shgc,
-        )
-
-        # Demand must never be negative
-        self.assertTrue(
-            np.all(demand_with_solar >= 0.0), "Demand with solar gains should never be negative"
         )
 
         # With solar gains, demand should not increase at any timestep
@@ -1804,6 +1799,24 @@ class TestHeatingDemand(unittest.TestCase):
         )
         np.testing.assert_allclose(legacy_demand, balance["heating_demand_kwh"])
 
+    def test_calculate_heating_demand_physics_with_strong_solar_gains_can_be_negative(self):
+        """Strong solar gains can make residual heating demand negative."""
+        demand = utils.calculate_heating_demand_physics(
+            u_value=0.35,
+            envelope_area=380.0,
+            ventilation_rate=0.4,
+            heated_volume=240.0,
+            indoor_target_temperature=20.0,
+            outdoor_temperature_forecast=np.array([18.0, 18.0, 18.0, 18.0]),
+            optimization_time_step=60,
+            solar_irradiance_forecast=np.array([0.0, 400.0, 700.0, 0.0]),
+            window_area=45.0,
+            shgc=0.65,
+        )
+
+        self.assertLess(demand[1], 0.0)
+        self.assertLess(demand[2], 0.0)
+
     def test_calculate_heating_demand_physics_scaling_with_timestep(self):
         """Sanity check: total demand scales appropriately with optimization_time_step."""
         indoor_temp = 21.0
@@ -1852,7 +1865,7 @@ class TestHeatingDemand(unittest.TestCase):
         )
 
     def test_calculate_heating_demand_physics_with_internal_gains_reduces_demand(self):
-        """Internal gains from electrical load reduce heating demand, and demand never becomes negative."""
+        """Internal gains from electrical load reduce heating demand."""
         indoor_temp = 21.0
         outdoor_temps = np.array([0.0, 0.0, 0.0, 0.0])
         optimization_time_step = 60  # minutes
@@ -1887,12 +1900,6 @@ class TestHeatingDemand(unittest.TestCase):
             internal_gains_factor=internal_gains_factor,
         )
 
-        # Demand must never be negative
-        self.assertTrue(
-            np.all(demand_with_internal >= 0.0),
-            "Demand with internal gains should never be negative",
-        )
-
         # With internal gains, demand should not increase at any timestep
         self.assertTrue(
             np.all(demand_with_internal <= demand_no_internal),
@@ -1906,6 +1913,23 @@ class TestHeatingDemand(unittest.TestCase):
             np.sum(demand_no_internal),
             "Internal gains should reduce total heating demand",
         )
+
+    def test_calculate_heating_demand_physics_with_strong_internal_gains_can_be_negative(self):
+        """Strong internal gains can make residual heating demand negative."""
+        demand = utils.calculate_heating_demand_physics(
+            u_value=0.35,
+            envelope_area=380.0,
+            ventilation_rate=0.4,
+            heated_volume=240.0,
+            indoor_target_temperature=21.0,
+            outdoor_temperature_forecast=np.array([18.0, 18.0, 18.0, 18.0]),
+            optimization_time_step=60,
+            internal_gains_forecast=np.array([0.0, 6000.0, 7000.0, 0.0]),
+            internal_gains_factor=0.8,
+        )
+
+        self.assertLess(demand[1], 0.0)
+        self.assertLess(demand[2], 0.0)
 
     def test_calculate_heating_demand_physics_with_both_solar_and_internal_gains(self):
         """Both solar and internal gains reduce heating demand cumulatively."""
@@ -1972,12 +1996,6 @@ class TestHeatingDemand(unittest.TestCase):
             shgc=shgc,
             internal_gains_forecast=load_forecast,
             internal_gains_factor=internal_gains_factor,
-        )
-
-        # Demand must never be negative
-        self.assertTrue(
-            np.all(demand_both_gains >= 0.0),
-            "Demand with both gains should never be negative",
         )
 
         # Per-timestep checks: gains must never increase demand at any timestep

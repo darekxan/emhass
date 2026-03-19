@@ -423,10 +423,12 @@ def calculate_heating_demand_physics_components(
     :param optimization_time_step: Optimization time step in minutes
     :type optimization_time_step: int
     :param solar_irradiance_forecast: Global Horizontal Irradiance (GHI) in W/m² for each timestep.
-        If provided along with window_area, solar gains will be subtracted from heating demand.
+        If provided along with window_area, solar gains will be subtracted from heating demand
+        and may drive the residual demand negative when passive gains exceed losses.
     :type solar_irradiance_forecast: np.ndarray | pd.Series | None, optional
     :param window_area: Total window area in m². If provided along with solar_irradiance_forecast,
-        solar gains will reduce heating demand. Typical values: 15-25% of floor area.
+        solar gains will reduce heating demand and may produce negative residual demand.
+        Typical values: 15-25% of floor area.
     :type window_area: float | None, optional
     :param shgc: Solar Heat Gain Coefficient (dimensionless, 0-1). Fraction of solar radiation
         that becomes heat inside the building. Typical values:
@@ -437,7 +439,8 @@ def calculate_heating_demand_physics_components(
     :type shgc: float, optional
     :param internal_gains_forecast: Electrical load power forecast in W for each timestep.
         If provided along with internal_gains_factor > 0, internal gains from electrical
-        appliances will be subtracted from heating demand.
+        appliances will be subtracted from heating demand and may produce negative residual
+        demand when gains exceed losses.
     :type internal_gains_forecast: np.ndarray | pd.Series | None, optional
     :param internal_gains_factor: Factor (0-1) representing what fraction of electrical load
         becomes useful internal heat gains. Typical values:
@@ -449,7 +452,7 @@ def calculate_heating_demand_physics_components(
     :type internal_gains_factor: float, optional
     :return: Dictionary containing component arrays in kWh per timestep:
         `heat_loss_kwh`, `solar_gains_kwh`, `internal_gains_kwh`,
-        and `heating_demand_kwh`.
+        and signed `heating_demand_kwh`.
     :rtype: dict[str, np.ndarray]
 
     Example:
@@ -569,7 +572,7 @@ def calculate_heating_demand_physics_components(
         # load_power is in W, convert to kW; factor is dimensionless (0-1)
         internal_gains_kw = internal_gains * internal_gains_factor / W_TO_KW
 
-    net_heating_demand_kw = np.maximum(total_loss_kw - solar_gains_kw - internal_gains_kw, 0.0)
+    net_heating_demand_kw = total_loss_kw - solar_gains_kw - internal_gains_kw
 
     # Convert to kWh for the timestep
     hours_per_timestep = optimization_time_step / 60.0
