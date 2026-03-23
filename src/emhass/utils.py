@@ -369,34 +369,25 @@ def calculate_dual_thermal_demand(
     internal_gains_factor: float = 0.0,
 ) -> dict[str, np.ndarray]:
     r"""
-    Calculate heating and cooling demand components simultaneously using physics-based approach.
+    Calculate net thermal demand using a unified energy-balance approach.
 
-    This function calculates both heating and cooling demands for each timestep, enabling
-    dual-mode operation. Demands are calculated based on:
-
-    1. **Transmission losses/gains**: U-value × envelope area × temperature difference
-    2. **Ventilation losses/gains**: Based on ventilation rate and air properties
-    3. **Solar gains**: Window area × SHGC × solar irradiance
-    4. **Internal gains**: From occupants, appliances, lights
-
-    **Temperature Differences:**
-
-    - **Heating**: max(target - outdoor, 0)
-    - **Cooling**: max(outdoor - target, 0)
-
-    **Thermal Loads (kW):**
+    The net thermal load at each timestep is computed as a single signed quantity:
 
     .. math::
-        Load_{heating} = U \times A \times \Delta T_{heat} + V_{vent} \times \rho \times c_p \times \Delta T_{heat}
+        \text{net} = (U \cdot A + \dot{V} \cdot \rho \cdot c_p) \cdot (T_{indoor} - T_{outdoor})
+                     - P_{solar} - P_{internal}
+
+    where positive net means heat is leaving the building (heating needed) and negative
+    net means heat is entering the building (cooling needed).  Solar and internal gains
+    always act to reduce heating demand and increase cooling demand regardless of which
+    direction the temperature difference falls.
+
+    The signed thermal balance returned is:
 
     .. math::
-        Load_{cooling} = U \times A \times \Delta T_{cool} + V_{vent} \times \rho \times c_p \times \Delta T_{cool}
+        \text{thermal\_balance} = -\text{net}
 
-    **Final Demands (kWh):**
-
-    - **Heating demand**: max(load - solar_gains - internal_gains, 0)
-    - **Cooling demand**: max(load + solar_gains + internal_gains, 0)
-    - **Thermal balance**: cooling_demand - heating_demand (positive = cooling need, negative = heating need)
+    so ``thermal_balance > 0`` ↔ cooling need, ``thermal_balance < 0`` ↔ heating need.
 
     :param u_value: Thermal transmittance of envelope (W/m²K)
     :type u_value: float
@@ -433,85 +424,61 @@ def calculate_dual_thermal_demand(
     else:
         outdoor_temps = np.asarray(outdoor_temperature_forecast)
 
-    # Calculate heating and cooling temperature differences
-    heating_temp_diff = indoor_target_temperature - outdoor_temps
-    cooling_temp_diff = outdoor_temps - indoor_target_temperature
+    # Signed temperature difference: positive = indoor warmer than outdoor (heat leaving)
+    temp_diff = indoor_target_temperature - outdoor_temps
 
-    # Apply non-negativity constraints
-    heating_temp_diff = np.maximum(heating_temp_diff, 0.0)
-    cooling_temp_diff = np.maximum(cooling_temp_diff, 0.0)
-
-    # Transmission losses/gains (kW)
-    heating_transmission_kw = u_value * envelope_area * heating_temp_diff / 1000.0
-    cooling_transmission_kw = u_value * envelope_area * cooling_temp_diff / 1000.0
-
-    # Ventilation losses/gains (kW)
-    # Air properties: density ≈ 1.2 kg/m³, specific heat ≈ 1.005 kJ/(kg·K)
+    # Combined heat-transfer coefficient (kW/K)
+    # Transmission: U·A [W/K] / 1000
+    # Ventilation: ACH × V × ρ_air × cp_air [W/K] / 1000
     air_density = 1.2  # kg/m³
     air_heat_capacity = 1.005  # kJ/(kg·K)
-    heating_ventilation_kw = (
-        ventilation_rate
-        * heated_volume
-        * air_density
-        * air_heat_capacity
-        * heating_temp_diff
-        / 3600.0
-    )
-    cooling_ventilation_kw = (
-        ventilation_rate
-        * heated_volume
-        * air_density
-        * air_heat_capacity
-        * cooling_temp_diff
-        / 3600.0
+    ua_total_kw_per_k = (
+        u_value * envelope_area / 1000.0
+        + ventilation_rate * heated_volume * air_density * air_heat_capacity / 3600.0
     )
 
-    # Total thermal loads (kW)
-    heating_load_kw = heating_transmission_kw + heating_ventilation_kw
-    cooling_load_kw = cooling_transmission_kw + cooling_ventilation_kw
+    # Net envelope heat flow (kW): positive = heat leaving building (cold outside)
+    envelope_load_kw = ua_total_kw_per_k * temp_diff
 
-    # Solar gains calculation (kW)
+    # Solar gains (kW) — always heat entering the building
     solar_gains_kw = np.zeros_like(outdoor_temps)
     if solar_irradiance_forecast is not None and window_area is not None:
         if isinstance(solar_irradiance_forecast, pd.Series):
             solar_irradiance = solar_irradiance_forecast.values
         else:
             solar_irradiance = np.asarray(solar_irradiance_forecast)
-
         solar_irradiance = solar_irradiance.reshape(-1)
-
         # Window projection factor accounts for window orientation variability
         window_projection_factor = 0.3
         solar_gains_kw = window_area * shgc * solar_irradiance * window_projection_factor / 1000.0
 
-    # Internal gains calculation (kW)
+    # Internal gains (kW) — always heat entering the building
     internal_gains_kw = np.zeros_like(outdoor_temps)
     if internal_gains_forecast is not None and internal_gains_factor > 0:
         if isinstance(internal_gains_forecast, pd.Series):
             internal_gains = internal_gains_forecast.values
         else:
             internal_gains = np.asarray(internal_gains_forecast)
-
         internal_gains = internal_gains.reshape(-1)
         internal_gains_kw = internal_gains * internal_gains_factor / 1000.0
 
-    # Convert to kWh based on optimization timestep
+    # Net thermal load (kW): positive = heating needed, negative = cooling needed
+    # Solar and internal gains reduce heating need / increase cooling need regardless of
+    # which side of the temperature setpoint the outdoor temperature sits.
+    net_load_kw = envelope_load_kw - solar_gains_kw - internal_gains_kw
+
+    # Convert to kWh
     hours = optimization_time_step / 60.0
-    heating_load_kwh = heating_load_kw * hours
-    cooling_load_kwh = cooling_load_kw * hours
+    net_load_kwh = net_load_kw * hours
     solar_gains_kwh = solar_gains_kw * hours
     internal_gains_kwh = internal_gains_kw * hours
 
-    # Final demand calculations
-    # For heating: demand = load - gains (gains reduce heating need)
-    # For cooling: demand = load + gains (gains increase cooling need)
-    heating_demand_kwh = np.maximum(heating_load_kwh - solar_gains_kwh - internal_gains_kwh, 0.0)
-    cooling_demand_kwh = np.maximum(cooling_load_kwh + solar_gains_kwh + internal_gains_kwh, 0.0)
+    # Retain legacy envelope-only load keys (without gains) for callers that inspect them
+    heating_load_kwh = np.maximum(envelope_load_kw, 0.0) * hours
+    cooling_load_kwh = np.maximum(-envelope_load_kw, 0.0) * hours
 
-    # Unified thermal balance: positive = cooling need, negative = heating need.
-    # Since heating_demand and cooling_demand are mutually exclusive (at most one nonzero
-    # per timestep), this signed balance is lossless.
-    thermal_balance_kwh = cooling_demand_kwh - heating_demand_kwh
+    # Signed thermal balance: positive = cooling need, negative = heating need
+    thermal_balance_kwh = -net_load_kwh
 
     return {
         "heating_load_kwh": heating_load_kwh,
