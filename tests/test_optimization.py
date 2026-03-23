@@ -3922,6 +3922,148 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "Load 1 with 0 hours should be deactivated",
         )
 
+    # ── thermal_battery dual-mode cache warm-start gap regression tests ─────────
+
+    def test_thermal_battery_dual_mode_params_preallocated(self):
+        """Verify cooling_cops and cooling_demand are pre-allocated at init time.
+
+        Before the fix, these were only created lazily inside
+        _add_thermal_battery_constraints, so update_thermal_params on a cache
+        hit would silently skip them, leaving stale zero values.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        # Both dual-mode parameters must be in param_thermal right after init
+        self.assertIn(0, opt.param_thermal)
+        self.assertIn("cooling_cops", opt.param_thermal[0])
+        self.assertIn("cooling_demand", opt.param_thermal[0])
+
+        # Their values should be pre-filled (not None)
+        self.assertIsNotNone(opt.param_thermal[0]["cooling_cops"].value)
+        self.assertIsNotNone(opt.param_thermal[0]["cooling_demand"].value)
+
+    def test_thermal_battery_dual_mode_cache_update_cooling_params(self):
+        """Verify update_thermal_params refreshes cooling_cops and cooling_demand.
+
+        Simulates a cache hit by calling update_thermal_params after a first
+        solve and verifying the cooling parameters received fresh values.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        # First call: cold outdoor → heating
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 5.0
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        # Capture cooling_cops after first solve (cold outdoor)
+        cool_cops_after_first = opt.param_thermal[0]["cooling_cops"].value.copy()
+
+        # Simulate cache hit: new outdoor temps (hot → different cooling COPs)
+        hot_df = self.df_input_data_dayahead.copy()
+        hot_df["outdoor_temperature_forecast"] = 35.0
+        opt.update_thermal_params(
+            self.optim_conf,
+            hot_df,
+            self.p_load_forecast.values.ravel(),
+        )
+
+        cool_cops_after_update = opt.param_thermal[0]["cooling_cops"].value
+
+        # cooling_cops must have changed when outdoor temperature changed
+        self.assertFalse(
+            np.allclose(cool_cops_after_first, cool_cops_after_update),
+            "cooling_cops should be updated on cache hit (update_thermal_params)",
+        )
+
+    def test_thermal_battery_dual_mode_result_columns(self):
+        """Verify dual-mode result columns heat_active and cool_active are present."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+        }
+
+        opt_res = self.run_optimization_with_config([{"thermal_battery": config}])
+
+        self.assertIn("heat_active0", opt_res.columns)
+        self.assertIn("cool_active0", opt_res.columns)
+
+        # Mutual exclusivity: heat_active + cool_active <= 1 at every timestep
+        mutual = opt_res["heat_active0"] + opt_res["cool_active0"]
+        self.assertTrue(
+            (mutual <= 1).all(),
+            "Mutual exclusivity violated: heat_active + cool_active > 1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
