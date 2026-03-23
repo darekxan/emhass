@@ -2320,7 +2320,8 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
                     type_var="thermal_mode",
                     **ctx.common_kwargs,
                 )
-                cols.append(f"thermal_mode_heater{k}")
+                # thermal_mode is computed on-the-fly and posted to HA but is not
+                # stored as a column in opt_res_latest, so don't add it to cols.
     return cols
 
 
