@@ -1675,6 +1675,141 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(found_cool, "Should publish cooling demand")
         self.assertTrue(found_mode, "Should publish thermal mode")
 
+    async def test_unified_thermal_sensor_functions(self):
+        """
+        Test the standalone unified thermal balance publisher functions.
+        """
+        # Import the functions directly for testing
+        from emhass.thermal_balance_publisher import (
+            prepare_custom_thermal_balance_ids,
+            update_thermal_sensor_config,
+        )
+
+        # Test prepare_custom_thermal_balance_ids
+        custom_ids = prepare_custom_thermal_balance_ids(3, prefix="test_")
+        self.assertEqual(len(custom_ids), 3, "Should create the correct number of sensor configs")
+        self.assertEqual(
+            custom_ids[0]["entity_id"],
+            "test_sensor.thermal_balance0",
+            "Entity ID should be correctly formatted",
+        )
+        self.assertEqual(custom_ids[0]["device_class"], "energy", "Device class should be energy")
+        self.assertEqual(custom_ids[0]["unit_of_measurement"], "kWh", "Default unit should be kWh")
+
+        # Test update_thermal_sensor_config
+        passed_data = {}
+        def_load_config = [
+            {"use_unified_thermal_model": True, "thermal_config": {}},
+            {"use_unified_thermal_model": True, "thermal_config": {}},
+        ]
+
+        updated_data = update_thermal_sensor_config(passed_data, def_load_config)
+        self.assertIn(
+            "custom_thermal_balance_id", updated_data, "Should add thermal balance sensors"
+        )
+        self.assertEqual(
+            len(updated_data["custom_thermal_balance_id"]),
+            2,
+            "Should create the right number of sensors",
+        )
+
+    async def test_publish_unified_thermal_data_function(self):
+        """Test the publish_unified_thermal_data function directly."""
+        from emhass.thermal_balance_publisher import publish_unified_thermal_data
+
+        # Mock RetrieveHass
+        mock_rh = Mock()
+        mock_rh.post_data = AsyncMock()
+
+        # Create test data
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=4, freq="30min")
+        thermal_balance = [1000.0, 500.0, -200.0, -800.0]
+        temp_values = [19.0, 20.0, 22.0, 24.0]
+        solar_values = [100.0, 200.0, 400.0, 500.0]
+
+        opt_res = pd.DataFrame(
+            {
+                "thermal_balance0": thermal_balance,
+                "predicted_temp_heater0": temp_values,
+                "solar_gain_heater0": solar_values,
+            },
+            index=idx,
+        )
+
+        # Create test parameters
+        params = {
+            "passed_data": {
+                "custom_thermal_balance_id": [
+                    {
+                        "entity_id": "sensor.thermal_balance0",
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": "Thermal Balance",
+                    }
+                ],
+                "custom_predicted_temperature_id": [
+                    {
+                        "entity_id": "sensor.temp",
+                        "unit_of_measurement": "C",
+                        "friendly_name": "Temperature",
+                    }
+                ],
+                "custom_solar_gain_id": [
+                    {
+                        "entity_id": "sensor.solar_gain",
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": "Solar Gain",
+                    }
+                ],
+            }
+        }
+
+        optim_conf = {
+            "number_of_deferrable_loads": 1,
+            "def_load_config": [{"use_unified_thermal_model": True, "thermal_config": {}}],
+        }
+
+        # Call the function
+        results = await publish_unified_thermal_data(
+            mock_rh, opt_res, idx, params, optim_conf, logger
+        )
+
+        # Verify the result
+        self.assertEqual(len(results), 3, "Should publish 3 sensors")
+        self.assertEqual(mock_rh.post_data.call_count, 3, "Should call post_data 3 times")
+
+        # Check what was posted
+        call_args_list = mock_rh.post_data.call_args_list
+        entities_posted = [args[0][2] for args in call_args_list]
+        self.assertIn(
+            "sensor.thermal_balance0", entities_posted, "Should publish thermal balance sensor"
+        )
+        self.assertIn("sensor.temp", entities_posted, "Should publish temperature sensor")
+        self.assertIn("sensor.solar_gain", entities_posted, "Should publish solar gain sensor")
+
+        # Check attributes for thermal balance sensor
+        for args in call_args_list:
+            if args[0][2] == "sensor.thermal_balance0" and "attributes" in args[1]:
+                attrs = args[1]["attributes"]
+                self.assertIn("mode", attrs, "Thermal balance should have mode attribute")
+                self.assertIn(
+                    "heating_demand", attrs, "Thermal balance should have heating_demand attribute"
+                )
+                self.assertIn(
+                    "cooling_demand", attrs, "Thermal balance should have cooling_demand attribute"
+                )
+
+                # First value is 1000.0 which is heating
+                self.assertEqual(
+                    attrs["mode"],
+                    "heating",
+                    "Mode should be 'heating' for positive thermal balance",
+                )
+                self.assertGreater(attrs["heating_demand"], 0, "Heating demand should be positive")
+                self.assertEqual(
+                    attrs["cooling_demand"], 0, "Cooling demand should be 0 for heating mode"
+                )
+                break
+
     async def test_thermal_mode_calculation(self):
         """
         Test that thermal mode is correctly calculated from heat_active and cool_active.

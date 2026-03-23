@@ -23,6 +23,10 @@ from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
 from emhass.retrieve_hass import RetrieveHass
+from emhass.thermal_balance_publisher import (
+    publish_unified_thermal_data,
+    update_thermal_sensor_config,
+)
 
 default_csv_filename = "opt_res_latest.csv"
 default_pkl_suffix = "_mlf.pkl"
@@ -2187,18 +2191,51 @@ async def _publish_thermal_variable(
 
 
 async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
-    """Publish predicted temperature, heating demand, and cooling mode for thermal loads."""
+    """Publish thermal data using either the unified or legacy approach."""
     cols = []
+
+    # Check if unified thermal model is being used
+    unified_thermal_model = False
+    def_load_config = ctx.optim_conf.get("def_load_config", [])
+    if isinstance(def_load_config, list):
+        for load_cfg in def_load_config:
+            if load_cfg.get("use_unified_thermal_model", False):
+                unified_thermal_model = True
+                break
+
+    # If unified thermal model is being used, use the dedicated publisher
+    if unified_thermal_model:
+        # Update sensor configuration to include thermal balance sensors if needed
+        ctx.params["passed_data"] = update_thermal_sensor_config(
+            ctx.params["passed_data"], def_load_config
+        )
+
+        # Use unified thermal balance publisher
+        unified_cols = await publish_unified_thermal_data(
+            ctx.rh,
+            opt_res_latest,
+            ctx.idx,
+            ctx.params,
+            ctx.optim_conf,
+            ctx.logger,
+            **ctx.common_kwargs,
+        )
+        cols.extend(unified_cols)
+        return cols
+
+    # Otherwise use legacy thermal publishing approach
     if "custom_predicted_temperature_id" not in ctx.params["passed_data"]:
         return cols
+
     custom_temp = ctx.params["passed_data"]["custom_predicted_temperature_id"]
     custom_heat = ctx.params["passed_data"].get("custom_heating_demand_id")
     custom_solar = ctx.params["passed_data"].get("custom_solar_gain_id")
     custom_cool = ctx.params["passed_data"].get("custom_cooling_demand_id")
     custom_thermal_mode = ctx.params["passed_data"].get("custom_thermal_mode_id")
-    def_load_config = ctx.optim_conf.get("def_load_config", [])
+
     if not isinstance(def_load_config, list):
         def_load_config = []
+
     for k in range(ctx.optim_conf["number_of_deferrable_loads"]):
         if k >= len(def_load_config):
             continue
