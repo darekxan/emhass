@@ -57,6 +57,8 @@ jobs:
             EMHASS_BUILD_TYPE=release
             EMHASS_GIT_SHA=${{ github.sha }}
           load: true
+          cache-from: type=gha,scope=${{ matrix.platform.target_arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform.target_arch }}
       # Extract a list of the installed Debian packages, export as artifact for vulnerability scanning with OSV
       - name: Export Debian package list
         run: mkdir OSV && docker run --rm --entrypoint '/bin/cat' ${{ steps.cache.outputs.imageid }} /var/lib/dpkg/status >> ./OSV/${{ matrix.platform.target_arch }}.status
@@ -89,6 +91,7 @@ jobs:
             EMHASS_GIT_SHA=${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform.target_arch }}
       # Export the build images as artifact for the next job of merging
       - name: Export digest
         run: |
