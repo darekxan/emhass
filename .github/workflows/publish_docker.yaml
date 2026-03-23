@@ -54,6 +54,8 @@ jobs:
           build-args: |
             TARGETARCH=${{ matrix.platform.target_arch }}
             os_version=${{ matrix.platform.os_version }}
+            EMHASS_BUILD_TYPE=release
+            EMHASS_GIT_SHA=${{ github.sha }}
           load: true
       # Extract a list of the installed Debian packages, export as artifact for vulnerability scanning with OSV
       - name: Export Debian package list
@@ -83,6 +85,8 @@ jobs:
           build-args: |
             TARGETARCH=${{ matrix.platform.target_arch }}
             os_version=${{ matrix.platform.os_version }}
+            EMHASS_BUILD_TYPE=release
+            EMHASS_GIT_SHA=${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }},push-by-digest=true,name-canonical=true,push=true
       # Export the build images as artifact for the next job of merging

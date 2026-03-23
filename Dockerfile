@@ -8,6 +8,10 @@
 ARG TARGETARCH
 # armhf=raspbian, amd64,armv7,aarch64=debian
 ARG os_version=debian
+# Build type: "release" for production images, "test" for test/dev images
+ARG EMHASS_BUILD_TYPE=release
+# Git commit SHA baked in at build time
+ARG EMHASS_GIT_SHA=unknown
 
 FROM ghcr.io/home-assistant/$TARGETARCH-base-$os_version:bookworm AS base
 
@@ -85,6 +89,12 @@ COPY pyproject.toml /app/
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 
+# Expose build metadata as runtime environment variables
+ARG EMHASS_BUILD_TYPE
+ARG EMHASS_GIT_SHA
+ENV EMHASS_BUILD_TYPE=${EMHASS_BUILD_TYPE}
+ENV EMHASS_GIT_SHA=${EMHASS_GIT_SHA}
+
 # Docker Labels for hass
 LABEL \
     io.hass.name="emhass" \
@@ -93,7 +103,8 @@ LABEL \
     io.hass.type="addon" \
     io.hass.arch="aarch64|amd64" \
     org.opencontainers.image.source="https://github.com/darekxan/emhass" \
-    org.opencontainers.image.description="EMHASS python package and requirements, in Home Assistant Debian container."
+    org.opencontainers.image.description="EMHASS python package and requirements, in Home Assistant Debian container." \
+    org.opencontainers.image.revision=${EMHASS_GIT_SHA}
 
 # Set up venv and add it to the PATH so it persists across RUN layers
 RUN uv venv
