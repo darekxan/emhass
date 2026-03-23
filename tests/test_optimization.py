@@ -4064,6 +4064,181 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "Mutual exclusivity violated: heat_active + cool_active > 1",
         )
 
+    # ── thermal_config dual-mode tests ──────────────────────────────────────────
+
+    def _make_thermal_config_dual_mode(self, outdoor_temps=10.0):
+        """Return a prepared DataFrame and dual-mode thermal_config dict."""
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = outdoor_temps
+        config = {
+            "start_temperature": 20.0,
+            "cooling_constant": 0.1,
+            "heating_rate": 10.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+        }
+        return df, config
+
+    def test_thermal_config_dual_mode_solves(self):
+        """Basic sanity: dual-mode thermal_config optimization solves successfully."""
+        df, config = self._make_thermal_config_dual_mode()
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        self.assertIsInstance(opt_res, type(pd.DataFrame()))
+        self.assertIn("P_deferrable0", opt_res.columns)
+        self.assertIn("predicted_temp_heater0", opt_res.columns)
+
+    def test_thermal_config_dual_mode_result_columns(self):
+        """Dual-mode thermal_config should produce heat_active and cool_active columns.
+
+        Note: thermal_config uses an RC model and does not emit cooling_demand_heater{k}
+        (that is a thermal_battery physics-model concept). The mode indicators and
+        predicted temperature are the primary dual-mode outputs for thermal_config.
+        """
+        df, config = self._make_thermal_config_dual_mode()
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        self.assertIn("heat_active0", opt_res.columns, "heat_active0 missing from result")
+        self.assertIn("cool_active0", opt_res.columns, "cool_active0 missing from result")
+        self.assertIn(
+            "predicted_temp_heater0", opt_res.columns, "predicted_temp_heater0 missing from result"
+        )
+
+    def test_thermal_config_dual_mode_mutual_exclusivity(self):
+        """heat_active + cool_active must never exceed 1 at any timestep."""
+        df, config = self._make_thermal_config_dual_mode()
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        mutual = opt_res["heat_active0"] + opt_res["cool_active0"]
+        self.assertTrue(
+            (mutual <= 1 + 1e-6).all(),
+            "Mutual exclusivity violated: heat_active + cool_active > 1",
+        )
+
+    def test_thermal_config_dual_mode_heating_when_cold(self):
+        """Optimizer should activate heating (not cooling) when outdoor temp is cold."""
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-10.0)
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        # When it's very cold, cooling activity should be zero or near-zero
+        cool_total = opt_res["cool_active0"].sum()
+        heat_total = opt_res["heat_active0"].sum()
+        self.assertGreater(
+            heat_total,
+            cool_total,
+            "Expected more heating than cooling activity when outdoor temp is -10°C",
+        )
+
+    def test_thermal_config_dual_mode_cooling_when_hot(self):
+        """Optimizer should activate cooling (not heating) when outdoor temp is very hot."""
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=40.0)
+        # Hot scenario: lower the max temp so cooling is actually needed
+        config["max_temperatures"] = [24.0] * 48
+        config["min_temperatures"] = [18.0] * 48
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        cool_total = opt_res["cool_active0"].sum()
+        heat_total = opt_res["heat_active0"].sum()
+        self.assertGreaterEqual(
+            cool_total,
+            heat_total,
+            "Expected at least as much cooling as heating when outdoor temp is 40°C",
+        )
+
+    def test_thermal_config_dual_mode_backward_compat(self):
+        """thermal_config without dual_mode_enabled must still work (single-mode)."""
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = 10.0
+        self.df_input_data_dayahead = df
+
+        single_config = {
+            "start_temperature": 20.0,
+            "cooling_constant": 0.1,
+            "heating_rate": 10.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+        }
+
+        opt_res = self.run_optimization_with_config([{"thermal_config": single_config}])
+
+        self.assertIsInstance(opt_res, type(pd.DataFrame()))
+        self.assertIn("P_deferrable0", opt_res.columns)
+        # No dual-mode columns should appear
+        self.assertNotIn("heat_active0", opt_res.columns)
+        self.assertNotIn("cool_active0", opt_res.columns)
+
+    def test_thermal_config_dual_mode_params_preallocated(self):
+        """Verify dual-mode CVXPY params are pre-allocated in _init_deferrable_load_params."""
+        _, config = self._make_thermal_config_dual_mode()
+
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        opt = self.create_optimization()
+
+        self.assertIn(0, opt.param_thermal)
+        for expected_key in (
+            "heatpump_cops",
+            "cooling_cops",
+            "heating_demand",
+            "cooling_demand",
+            "solar_gains",
+        ):
+            self.assertIn(
+                expected_key,
+                opt.param_thermal[0],
+                f"Expected '{expected_key}' pre-allocated in param_thermal[0]",
+            )
+            self.assertIsNotNone(opt.param_thermal[0][expected_key].value)
+
+    def test_thermal_config_dual_mode_cache_update_params(self):
+        """Verify update_thermal_params refreshes cooling params for thermal_config dual-mode."""
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=5.0)
+        self.df_input_data_dayahead = df
+
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        opt = self.create_optimization()
+
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        cool_cops_cold = opt.param_thermal[0]["cooling_cops"].value.copy()
+
+        # Simulate cache hit with hot outdoor temps
+        hot_df = df.copy()
+        hot_df["outdoor_temperature_forecast"] = 35.0
+        opt.update_thermal_params(
+            self.optim_conf,
+            hot_df,
+            self.p_load_forecast.values.ravel(),
+        )
+
+        cool_cops_hot = opt.param_thermal[0]["cooling_cops"].value
+        self.assertFalse(
+            np.allclose(cool_cops_cold, cool_cops_hot),
+            "cooling_cops for thermal_config should be updated on cache hit",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
