@@ -279,14 +279,11 @@ class Optimization:
                             n, name=f"thermal_config_cooling_cops_{k}"
                         )
                         self.param_thermal[k]["cooling_cops"].value = np.full(n, 3.0)
-                        self.param_thermal[k]["heating_demand"] = cp.Parameter(
-                            n, name=f"thermal_config_heating_demand_{k}"
+                        # Unified signed balance: positive = heating need, negative = cooling need.
+                        self.param_thermal[k]["thermal_balance"] = cp.Parameter(
+                            n, name=f"thermal_config_thermal_balance_{k}"
                         )
-                        self.param_thermal[k]["heating_demand"].value = np.zeros(n)
-                        self.param_thermal[k]["cooling_demand"] = cp.Parameter(
-                            n, name=f"thermal_config_cooling_demand_{k}"
-                        )
-                        self.param_thermal[k]["cooling_demand"].value = np.zeros(n)
+                        self.param_thermal[k]["thermal_balance"].value = np.zeros(n)
                         self.param_thermal[k]["solar_gains"] = cp.Parameter(
                             n, name=f"thermal_config_solar_gains_{k}"
                         )
@@ -344,10 +341,12 @@ class Optimization:
                             n, name=f"thermal_battery_cooling_cops_{k}"
                         )
                         self.param_thermal[k]["cooling_cops"].value = np.full(n, 3.0)
-                        self.param_thermal[k]["cooling_demand"] = cp.Parameter(
-                            n, name=f"thermal_battery_cooling_demand_{k}"
+                        # Unified signed balance: positive = heating need, negative = cooling need.
+                        # Replaces the separate heating_demand / cooling_demand pair.
+                        self.param_thermal[k]["thermal_balance"] = cp.Parameter(
+                            n, name=f"thermal_battery_thermal_balance_{k}"
                         )
-                        self.param_thermal[k]["cooling_demand"].value = np.zeros(n)
+                        self.param_thermal[k]["thermal_balance"].value = np.zeros(n)
 
         # Legacy compatibility - keep param_thermal_start_temps as alias
         self.param_thermal_start_temps = {
@@ -584,13 +583,9 @@ class Optimization:
                         internal_gains_forecast=internal_gains_forecast,
                         internal_gains_factor=internal_gains_factor,
                     )
-                    if "heating_demand" in params:
-                        params["heating_demand"].value = np.array(
-                            thermal_demands["heating_demand_kwh"][:n]
-                        )
-                    if "cooling_demand" in params:
-                        params["cooling_demand"].value = np.array(
-                            thermal_demands["cooling_demand_kwh"][:n]
+                    if "thermal_balance" in params:
+                        params["thermal_balance"].value = np.array(
+                            thermal_demands["thermal_balance_kwh"][:n]
                         )
                     if "solar_gains" in params:
                         params["solar_gains"].value = np.array(
@@ -701,16 +696,13 @@ class Optimization:
                             internal_gains_forecast=internal_gains_forecast,
                             internal_gains_factor=internal_gains_factor,
                         )
-                        params["heating_demand"].value = np.array(
-                            thermal_demands["heating_demand_kwh"][:n]
-                        )
+                        if "thermal_balance" in params:
+                            params["thermal_balance"].value = np.array(
+                                thermal_demands["thermal_balance_kwh"][:n]
+                            )
                         params["solar_gains"].value = np.array(
                             thermal_demands["solar_gains_kwh"][:n]
                         )
-                        if "cooling_demand" in params:
-                            params["cooling_demand"].value = np.array(
-                                thermal_demands["cooling_demand_kwh"][:n]
-                            )
                     else:
                         heat_balance = utils.calculate_heating_demand_physics_components(
                             u_value=hc["u_value"],
@@ -1490,13 +1482,9 @@ class Optimization:
                     internal_gains_forecast=internal_gains_forecast,
                     internal_gains_factor=internal_gains_factor,
                 )
-                if "heating_demand" in params:
-                    params["heating_demand"].value = np.array(
-                        thermal_demands["heating_demand_kwh"][:required_len]
-                    )
-                if "cooling_demand" in params:
-                    params["cooling_demand"].value = np.array(
-                        thermal_demands["cooling_demand_kwh"][:required_len]
+                if "thermal_balance" in params:
+                    params["thermal_balance"].value = np.array(
+                        thermal_demands["thermal_balance_kwh"][:required_len]
                     )
                 if "solar_gains" in params:
                     params["solar_gains"].value = np.array(
@@ -1912,7 +1900,7 @@ class Optimization:
                     solar_irradiance = vals[:required_len]
 
                 if dual_mode_enabled:
-                    # Dual-mode: calculate both heating and cooling demands
+                    # Dual-mode: calculate signed thermal balance
                     thermal_demands = utils.calculate_dual_thermal_demand(
                         u_value=hc["u_value"],
                         envelope_area=hc["envelope_area"],
@@ -1927,18 +1915,13 @@ class Optimization:
                         internal_gains_forecast=internal_gains_forecast,
                         internal_gains_factor=internal_gains_factor,
                     )
-                    heating_demand_vals = thermal_demands["heating_demand_kwh"]
-                    cooling_demand_vals = thermal_demands["cooling_demand_kwh"]
-                    params["heating_demand"].value = np.array(heating_demand_vals[:required_len])
+                    if "thermal_balance" in params:
+                        params["thermal_balance"].value = np.array(
+                            thermal_demands["thermal_balance_kwh"][:required_len]
+                        )
                     params["solar_gains"].value = np.array(
                         thermal_demands["solar_gains_kwh"][:required_len]
                     )
-                    # Store cooling demand separately
-                    if "cooling_demand" not in params:
-                        params["cooling_demand"] = cp.Parameter(
-                            required_len, name=f"thermal_battery_cooling_demand_{k}"
-                        )
-                    params["cooling_demand"].value = np.array(cooling_demand_vals[:required_len])
                 else:
                     # Single-mode: calculate only heating demand (backward compatible)
                     heat_balance = utils.calculate_heating_demand_physics_components(
@@ -2144,16 +2127,21 @@ class Optimization:
                         cool_cops_arr.value if hasattr(cool_cops_arr, "value") else cool_cops_arr
                     )
 
-                heating_demand_arr = self.param_thermal[k]["heating_demand"].value
-                cooling_demand_arr = self.param_thermal[k].get("cooling_demand", None)
-                if cooling_demand_arr is None:
-                    cooling_demand_arr = np.zeros(required_len)  # Fallback
-                else:
-                    cooling_demand_arr = (
-                        cooling_demand_arr.value
-                        if hasattr(cooling_demand_arr, "value")
-                        else cooling_demand_arr
+                # Dual-mode uses a single signed thermal_balance parameter
+                # (positive = heating need, negative = cooling need).
+                # Single-mode still reads the legacy heating_demand parameter.
+                thermal_balance_param = self.param_thermal[k].get("thermal_balance", None)
+                if thermal_balance_param is not None:
+                    thermal_balance_val = (
+                        thermal_balance_param.value
+                        if hasattr(thermal_balance_param, "value")
+                        else thermal_balance_param
                     )
+                    heating_demand_arr = np.maximum(thermal_balance_val, 0.0)
+                    cooling_demand_arr = np.maximum(-thermal_balance_val, 0.0)
+                else:
+                    heating_demand_arr = self.param_thermal[k]["heating_demand"].value
+                    cooling_demand_arr = np.zeros(required_len)
 
                 solar_gains_arr = self.param_thermal[k]["solar_gains"].value
                 thermal_losses_arr = self.param_thermal[k]["thermal_losses"].value
@@ -2259,7 +2247,9 @@ class Optimization:
             constraints.append(q_input[1:] == q_input[:-1] + alpha * (raw_heat[1:] - q_input[:-1]))
 
             # Temperature uses filtered Q_input instead of raw heat
-            # For dual-mode: heating_demand is subtracted, cooling_demand is added (building wants to cool)
+            # Dual-mode: - thermal_balance[t] = -heating_demand[t] + cooling_demand[t]
+            # (thermal_balance positive = heating need → subtracts from stored temp;
+            #  thermal_balance negative = cooling need → adds heat to stored temp)
             if dual_mode_enabled and cooling_demand_arr is not None:
                 constraints.append(
                     predicted_temp_thermal[1:]
@@ -2346,16 +2336,19 @@ class Optimization:
                 limit_vals = np.array([max_temperatures_list[i] for i in valid_indices])
                 constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
 
-        # Return heating_demand array for result building
-        heating_demand_arr = (
-            self.param_thermal[k]["heating_demand"].value
-            if k in self.param_thermal
-            else heating_demand
-        )
+        # Return demand array for result building.
+        # For dual-mode loads the signed thermal_balance is returned; for single-mode
+        # the legacy heating_demand value is returned (always >= 0).
+        if k in self.param_thermal and "thermal_balance" in self.param_thermal[k]:
+            demand_arr = self.param_thermal[k]["thermal_balance"].value
+        elif k in self.param_thermal:
+            demand_arr = self.param_thermal[k]["heating_demand"].value
+        else:
+            demand_arr = heating_demand
         solar_gains_arr = (
             self.param_thermal[k]["solar_gains"].value if k in self.param_thermal else solar_gains
         )
-        return predicted_temp_thermal, heating_demand_arr, q_input, solar_gains_arr
+        return predicted_temp_thermal, demand_arr, q_input, solar_gains_arr
 
     def _add_deferrable_load_constraints(
         self,
@@ -2836,42 +2829,34 @@ class Optimization:
                         opt_tp[f"heat_active{k}"] = np.round(get_val(heat_active_var)).astype(int)
                     if cool_active_var is not None:
                         opt_tp[f"cool_active{k}"] = np.round(get_val(cool_active_var)).astype(int)
-                    # Note: thermal_config dual-mode does not use physics-based demand arrays,
-                    # so there is no cooling_demand_heater{k} column (unlike thermal_battery).
+                    # Note: thermal_config dual-mode uses thermal_balance column (see loop below).
 
-        for k, heat_demand in heating_demands.items():
-            opt_tp[f"heating_demand_heater{k}"] = heat_demand
+        for k, demand in heating_demands.items():
+            # For dual-mode loads `demand` is the signed thermal_balance
+            # (positive = heating need, negative = cooling need).
+            # For single-mode loads `demand` is the non-negative heating demand.
+            if "def_load_config" in self.optim_conf and k < len(self.optim_conf["def_load_config"]):
+                load_conf = self.optim_conf["def_load_config"][k]
+                thermal_conf = load_conf.get("thermal_battery") or load_conf.get(
+                    "thermal_config", {}
+                )
+                is_dual = thermal_conf.get("dual_mode_enabled", False)
+            else:
+                is_dual = False
 
-            # Add cooling demand and mode indicators for dual-mode thermal loads
-            # Supports both thermal_battery and thermal_config dual-mode configs.
-            if "def_load_config" in self.optim_conf:
-                if k < len(self.optim_conf["def_load_config"]):
-                    load_conf = self.optim_conf["def_load_config"][k]
-                    # Check both thermal_battery and thermal_config for dual_mode_enabled
-                    thermal_conf = load_conf.get("thermal_battery") or load_conf.get(
-                        "thermal_config", {}
-                    )
-                    if thermal_conf.get("dual_mode_enabled", False):
-                        # Add cooling demand if available
-                        if k in self.param_thermal and "cooling_demand" in self.param_thermal[k]:
-                            cooling_demand_param = self.param_thermal[k]["cooling_demand"]
-                            if (
-                                hasattr(cooling_demand_param, "value")
-                                and cooling_demand_param.value is not None
-                            ):
-                                opt_tp[f"cooling_demand_heater{k}"] = cooling_demand_param.value
+            if is_dual:
+                opt_tp[f"thermal_balance_heater{k}"] = demand
+            else:
+                opt_tp[f"heating_demand_heater{k}"] = demand
 
-                        # Add binary mode indicators (heat_active, cool_active)
-                        heat_active_var = self.vars.get(f"heat_active_{k}")
-                        cool_active_var = self.vars.get(f"cool_active_{k}")
-                        if heat_active_var is not None:
-                            opt_tp[f"heat_active{k}"] = np.round(get_val(heat_active_var)).astype(
-                                int
-                            )
-                        if cool_active_var is not None:
-                            opt_tp[f"cool_active{k}"] = np.round(get_val(cool_active_var)).astype(
-                                int
-                            )
+            # Add binary mode indicators for dual-mode thermal loads
+            if is_dual:
+                heat_active_var = self.vars.get(f"heat_active_{k}")
+                cool_active_var = self.vars.get(f"cool_active_{k}")
+                if heat_active_var is not None:
+                    opt_tp[f"heat_active{k}"] = np.round(get_val(heat_active_var)).astype(int)
+                if cool_active_var is not None:
+                    opt_tp[f"cool_active{k}"] = np.round(get_val(cool_active_var)).astype(int)
 
         if solar_gains:
             for k, solar_gain in solar_gains.items():
@@ -3053,7 +3038,11 @@ class Optimization:
             # Refresh heating_demands for result building (stale numpy refs from first call)
             for k, params in self.param_thermal.items():
                 if params["type"] == "thermal_battery":
-                    self.heating_demands[k] = params["heating_demand"].value
+                    # Dual-mode: expose signed thermal_balance; single-mode: heating_demand.
+                    if "thermal_balance" in params:
+                        self.heating_demands[k] = params["thermal_balance"].value
+                    else:
+                        self.heating_demands[k] = params["heating_demand"].value
                     self.solar_gains[k] = params["solar_gains"].value
 
         # Update Energy Constraint Parameters for Deferrable Loads

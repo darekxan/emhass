@@ -3925,7 +3925,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
     # ── thermal_battery dual-mode cache warm-start gap regression tests ─────────
 
     def test_thermal_battery_dual_mode_params_preallocated(self):
-        """Verify cooling_cops and cooling_demand are pre-allocated at init time.
+        """Verify cooling_cops and thermal_balance are pre-allocated at init time.
 
         Before the fix, these were only created lazily inside
         _add_thermal_battery_constraints, so update_thermal_params on a cache
@@ -3960,14 +3960,14 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # Both dual-mode parameters must be in param_thermal right after init
         self.assertIn(0, opt.param_thermal)
         self.assertIn("cooling_cops", opt.param_thermal[0])
-        self.assertIn("cooling_demand", opt.param_thermal[0])
+        self.assertIn("thermal_balance", opt.param_thermal[0])
 
         # Their values should be pre-filled (not None)
         self.assertIsNotNone(opt.param_thermal[0]["cooling_cops"].value)
-        self.assertIsNotNone(opt.param_thermal[0]["cooling_demand"].value)
+        self.assertIsNotNone(opt.param_thermal[0]["thermal_balance"].value)
 
     def test_thermal_battery_dual_mode_cache_update_cooling_params(self):
-        """Verify update_thermal_params refreshes cooling_cops and cooling_demand.
+        """Verify update_thermal_params refreshes cooling_cops and thermal_balance.
 
         Simulates a cache hit by calling update_thermal_params after a first
         solve and verifying the cooling parameters received fresh values.
@@ -4193,8 +4193,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         for expected_key in (
             "heatpump_cops",
             "cooling_cops",
-            "heating_demand",
-            "cooling_demand",
+            "thermal_balance",
             "solar_gains",
         ):
             self.assertIn(

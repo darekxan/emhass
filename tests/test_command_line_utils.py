@@ -1608,11 +1608,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                     "friendly_name": "Heating Demand",
                 }
             ],
-            "custom_cooling_demand_id": [
+            "custom_thermal_balance_id": [
                 {
-                    "entity_id": "sensor.cooling_demand",
-                    "unit_of_measurement": "kW",
-                    "friendly_name": "Cooling Demand",
+                    "entity_id": "sensor.thermal_balance",
+                    "unit_of_measurement": "kWh",
+                    "friendly_name": "Thermal Balance",
                 }
             ],
             "custom_thermal_mode_id": [
@@ -1643,8 +1643,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_df = pd.DataFrame(
             {
                 "predicted_temp_heater0": [22.5],
-                "heating_demand_heater0": [500.0],
-                "cooling_demand_heater0": [300.0],
+                "thermal_balance_heater0": [-300.0],  # negative = cooling need
                 "heat_active0": heat_active,
                 "cool_active0": cool_active,
                 "thermal_mode_heater0": thermal_mode,
@@ -1667,12 +1666,10 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         # Verify all thermal data is published
         call_args_list = input_data_dict["rh"].post_data.call_args_list
         found_temp = any("sensor.temp" in str(args) for args in call_args_list)
-        found_heat = any("sensor.heating_demand" in str(args) for args in call_args_list)
-        found_cool = any("sensor.cooling_demand" in str(args) for args in call_args_list)
+        found_balance = any("sensor.thermal_balance" in str(args) for args in call_args_list)
         found_mode = any("sensor.thermal_mode" in str(args) for args in call_args_list)
         self.assertTrue(found_temp, "Should publish predicted temperature")
-        self.assertTrue(found_heat, "Should publish heating demand")
-        self.assertTrue(found_cool, "Should publish cooling demand")
+        self.assertTrue(found_balance, "Should publish thermal balance")
         self.assertTrue(found_mode, "Should publish thermal mode")
 
     async def test_unified_thermal_sensor_functions(self):

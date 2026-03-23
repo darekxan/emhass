@@ -2237,7 +2237,7 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
     custom_temp = ctx.params["passed_data"]["custom_predicted_temperature_id"]
     custom_heat = ctx.params["passed_data"].get("custom_heating_demand_id")
     custom_solar = ctx.params["passed_data"].get("custom_solar_gain_id")
-    custom_cool = ctx.params["passed_data"].get("custom_cooling_demand_id")
+    custom_thermal_balance = ctx.params["passed_data"].get("custom_thermal_balance_id")
     custom_thermal_mode = ctx.params["passed_data"].get("custom_thermal_mode_id")
 
     if not isinstance(def_load_config, list):
@@ -2288,14 +2288,15 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         )
         if col_s:
             cols.append(col_s)
-        # Publish cooling demand for dual-mode thermal batteries
+        # Publish signed thermal balance for dual-mode thermal batteries
+        # (positive = heating need, negative = cooling need)
         col_c = await _publish_thermal_variable(
             ctx.rh,
             opt_res_latest,
             ctx.idx,
             k,
-            custom_cool,
-            "cooling_demand_heater",
+            custom_thermal_balance,
+            "thermal_balance_heater",
             "energy",
             "energy",
             ctx.common_kwargs,

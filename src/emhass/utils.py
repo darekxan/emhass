@@ -396,6 +396,7 @@ def calculate_dual_thermal_demand(
 
     - **Heating demand**: max(load - solar_gains - internal_gains, 0)
     - **Cooling demand**: max(load + solar_gains + internal_gains, 0)
+    - **Thermal balance**: heating_demand - cooling_demand (positive = heating need, negative = cooling need)
 
     :param u_value: Thermal transmittance of envelope (W/m²K)
     :type u_value: float
@@ -422,7 +423,7 @@ def calculate_dual_thermal_demand(
     :param internal_gains_factor: Scaling factor for internal gains (0-1), defaults to 0.0
     :type internal_gains_factor: float, optional
     :return: Dictionary with keys: "heating_load_kwh", "cooling_load_kwh", "solar_gains_kwh", \
-        "internal_gains_kwh", "heating_demand_kwh", "cooling_demand_kwh"
+        "internal_gains_kwh", "thermal_balance_kwh" (positive = heating need, negative = cooling need)
     :rtype: dict[str, np.ndarray]
 
     """
@@ -507,13 +508,17 @@ def calculate_dual_thermal_demand(
     heating_demand_kwh = np.maximum(heating_load_kwh - solar_gains_kwh - internal_gains_kwh, 0.0)
     cooling_demand_kwh = np.maximum(cooling_load_kwh + solar_gains_kwh + internal_gains_kwh, 0.0)
 
+    # Unified thermal balance: positive = heating need, negative = cooling need
+    # Since heating_demand and cooling_demand are mutually exclusive (at most one nonzero
+    # per timestep), this signed balance is lossless.
+    thermal_balance_kwh = heating_demand_kwh - cooling_demand_kwh
+
     return {
         "heating_load_kwh": heating_load_kwh,
         "cooling_load_kwh": cooling_load_kwh,
         "solar_gains_kwh": solar_gains_kwh,
         "internal_gains_kwh": internal_gains_kwh,
-        "heating_demand_kwh": heating_demand_kwh,
-        "cooling_demand_kwh": cooling_demand_kwh,
+        "thermal_balance_kwh": thermal_balance_kwh,
     }
 
 
@@ -1266,7 +1271,7 @@ async def treat_runtimeparams(
     custom_predicted_temperature_id = []
     custom_heating_demand_id = []
     custom_solar_gain_id = []
-    custom_cooling_demand_id = []
+    custom_thermal_balance_id = []
     custom_thermal_mode_id = []
     for k in range(params["optim_conf"]["number_of_deferrable_loads"]):
         custom_deferrable_forecast_id.append(
@@ -1301,12 +1306,14 @@ async def treat_runtimeparams(
                 "friendly_name": f"Solar gain {k}",
             }
         )
-        custom_cooling_demand_id.append(
+        # Unified signed thermal balance (positive = heating need, negative = cooling need).
+        # Used for dual-mode loads; single-mode loads use custom_heating_demand_id above.
+        custom_thermal_balance_id.append(
             {
-                "entity_id": f"sensor.cooling_demand{k}",
+                "entity_id": f"sensor.thermal_balance{k}",
                 "device_class": "energy",
                 "unit_of_measurement": "kWh",
-                "friendly_name": f"Cooling demand {k}",
+                "friendly_name": f"Thermal balance {k}",
             }
         )
         custom_thermal_mode_id.append(
@@ -1387,7 +1394,7 @@ async def treat_runtimeparams(
         "custom_deferrable_forecast_id": custom_deferrable_forecast_id,
         "custom_predicted_temperature_id": custom_predicted_temperature_id,
         "custom_heating_demand_id": custom_heating_demand_id,
-        "custom_cooling_demand_id": custom_cooling_demand_id,
+        "custom_thermal_balance_id": custom_thermal_balance_id,
         "custom_solar_gain_id": custom_solar_gain_id,
         "custom_thermal_mode_id": custom_thermal_mode_id,
         "publish_prefix": "",
@@ -1978,9 +1985,9 @@ async def treat_runtimeparams(
             ]
         if "custom_solar_gain_id" in runtimeparams.keys():
             params["passed_data"]["custom_solar_gain_id"] = runtimeparams["custom_solar_gain_id"]
-        if "custom_cooling_demand_id" in runtimeparams.keys():
-            params["passed_data"]["custom_cooling_demand_id"] = runtimeparams[
-                "custom_cooling_demand_id"
+        if "custom_thermal_balance_id" in runtimeparams.keys():
+            params["passed_data"]["custom_thermal_balance_id"] = runtimeparams[
+                "custom_thermal_balance_id"
             ]
         if "custom_thermal_mode_id" in runtimeparams.keys():
             params["passed_data"]["custom_thermal_mode_id"] = runtimeparams[
