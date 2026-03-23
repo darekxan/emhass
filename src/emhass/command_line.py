@@ -2088,6 +2088,13 @@ async def _publish_standard_forecasts(
     """Publish PV, Load, Curtailment, and Hybrid Inverter data."""
     cols = []
     # Load Forecast
+    if "P_Load" not in opt_res_latest.columns:
+        ctx.logger.warning(
+            "P_Load column not found in optimization results "
+            "(optimization may have been infeasible). "
+            "Skipping standard forecast publishing."
+        )
+        return cols
     custom_load = ctx.params["passed_data"]["custom_load_forecast_id"]
     await ctx.rh.post_data(
         opt_res_latest["P_Load"],
