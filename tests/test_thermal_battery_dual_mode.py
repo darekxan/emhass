@@ -136,14 +136,14 @@ class TestDualThermalDemandCalculation(unittest.TestCase):
         for key in required_keys:
             self.assertEqual(len(demands[key]), n)
 
-        # When outdoor < target: heating need → thermal_balance > 0
-        self.assertGreater(demands["thermal_balance_kwh"][0], 0.0)
+        # When outdoor < target: heating need → thermal_balance < 0
+        self.assertLess(demands["thermal_balance_kwh"][0], 0.0)
 
         # When outdoor = target: balance ≈ 0 (may have small gains)
         self.assertEqual(demands["thermal_balance_kwh"][2], 0.0)
 
-        # When outdoor > target: cooling need → thermal_balance < 0
-        self.assertLess(demands["thermal_balance_kwh"][3], 0.0)
+        # When outdoor > target: cooling need → thermal_balance > 0
+        self.assertGreater(demands["thermal_balance_kwh"][3], 0.0)
 
     def test_dual_thermal_demand_with_solar_gains(self):
         """Test demand calculation with solar gains included."""
@@ -177,14 +177,14 @@ class TestDualThermalDemandCalculation(unittest.TestCase):
             internal_gains_factor=0.0,
         )
 
-        # Solar gains reduce heating need → balance decreases (less positive)
-        self.assertLess(
+        # Solar gains reduce heating need → balance increases (less negative)
+        self.assertGreater(
             demands_with_solar["thermal_balance_kwh"][0],
             demands_no_solar["thermal_balance_kwh"][0],
         )
 
-        # Solar gains increase cooling need → balance decreases (more negative)
-        self.assertLess(
+        # Solar gains increase cooling need → balance increases (more positive)
+        self.assertGreater(
             demands_with_solar["thermal_balance_kwh"][1],
             demands_no_solar["thermal_balance_kwh"][1],
         )

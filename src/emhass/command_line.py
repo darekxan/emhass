@@ -2289,7 +2289,7 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         if col_s:
             cols.append(col_s)
         # Publish signed thermal balance for dual-mode thermal batteries
-        # (positive = heating need, negative = cooling need)
+        # (positive = cooling need, negative = heating need)
         col_c = await _publish_thermal_variable(
             ctx.rh,
             opt_res_latest,

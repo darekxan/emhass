@@ -279,7 +279,7 @@ class Optimization:
                             n, name=f"thermal_config_cooling_cops_{k}"
                         )
                         self.param_thermal[k]["cooling_cops"].value = np.full(n, 3.0)
-                        # Unified signed balance: positive = heating need, negative = cooling need.
+                        # Unified signed balance: positive = cooling need, negative = heating need.
                         self.param_thermal[k]["thermal_balance"] = cp.Parameter(
                             n, name=f"thermal_config_thermal_balance_{k}"
                         )
@@ -341,7 +341,7 @@ class Optimization:
                             n, name=f"thermal_battery_cooling_cops_{k}"
                         )
                         self.param_thermal[k]["cooling_cops"].value = np.full(n, 3.0)
-                        # Unified signed balance: positive = heating need, negative = cooling need.
+                        # Unified signed balance: positive = cooling need, negative = heating need.
                         # Replaces the separate heating_demand / cooling_demand pair.
                         self.param_thermal[k]["thermal_balance"] = cp.Parameter(
                             n, name=f"thermal_battery_thermal_balance_{k}"
@@ -2128,7 +2128,7 @@ class Optimization:
                     )
 
                 # Dual-mode uses a single signed thermal_balance parameter
-                # (positive = heating need, negative = cooling need).
+                # (positive = cooling need, negative = heating need).
                 # Single-mode still reads the legacy heating_demand parameter.
                 thermal_balance_param = self.param_thermal[k].get("thermal_balance", None)
                 if thermal_balance_param is not None:
@@ -2137,8 +2137,8 @@ class Optimization:
                         if hasattr(thermal_balance_param, "value")
                         else thermal_balance_param
                     )
-                    heating_demand_arr = np.maximum(thermal_balance_val, 0.0)
-                    cooling_demand_arr = np.maximum(-thermal_balance_val, 0.0)
+                    heating_demand_arr = np.maximum(-thermal_balance_val, 0.0)
+                    cooling_demand_arr = np.maximum(thermal_balance_val, 0.0)
                 else:
                     heating_demand_arr = self.param_thermal[k]["heating_demand"].value
                     cooling_demand_arr = np.zeros(required_len)
@@ -2247,9 +2247,9 @@ class Optimization:
             constraints.append(q_input[1:] == q_input[:-1] + alpha * (raw_heat[1:] - q_input[:-1]))
 
             # Temperature uses filtered Q_input instead of raw heat
-            # Dual-mode: - thermal_balance[t] = -heating_demand[t] + cooling_demand[t]
-            # (thermal_balance positive = heating need → subtracts from stored temp;
-            #  thermal_balance negative = cooling need → adds heat to stored temp)
+            # Dual-mode: - heating_demand[t] + cooling_demand[t]
+            # (thermal_balance positive = cooling need → adds to stored temp via +cooling_demand;
+            #  thermal_balance negative = heating need → subtracts from stored temp via -heating_demand)
             if dual_mode_enabled and cooling_demand_arr is not None:
                 constraints.append(
                     predicted_temp_thermal[1:]
@@ -2833,7 +2833,7 @@ class Optimization:
 
         for k, demand in heating_demands.items():
             # For dual-mode loads `demand` is the signed thermal_balance
-            # (positive = heating need, negative = cooling need).
+            # (positive = cooling need, negative = heating need).
             # For single-mode loads `demand` is the non-negative heating demand.
             if "def_load_config" in self.optim_conf and k < len(self.optim_conf["def_load_config"]):
                 load_conf = self.optim_conf["def_load_config"][k]

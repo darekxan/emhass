@@ -1643,7 +1643,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         mock_df = pd.DataFrame(
             {
                 "predicted_temp_heater0": [22.5],
-                "thermal_balance_heater0": [-300.0],  # negative = cooling need
+                "thermal_balance_heater0": [300.0],  # positive = cooling need
                 "heat_active0": heat_active,
                 "cool_active0": cool_active,
                 "thermal_mode_heater0": thermal_mode,
@@ -1720,7 +1720,7 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
 
         # Create test data
         idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=4, freq="30min")
-        thermal_balance = [1000.0, 500.0, -200.0, -800.0]
+        thermal_balance = [-1000.0, -500.0, 200.0, 800.0]
         temp_values = [19.0, 20.0, 22.0, 24.0]
         solar_values = [100.0, 200.0, 400.0, 500.0]
 
@@ -1795,11 +1795,11 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
                     "cooling_demand", attrs, "Thermal balance should have cooling_demand attribute"
                 )
 
-                # First value is 1000.0 which is heating
+                # First value is -1000.0 which is heating need (negative = heating)
                 self.assertEqual(
                     attrs["mode"],
                     "heating",
-                    "Mode should be 'heating' for positive thermal balance",
+                    "Mode should be 'heating' for negative thermal balance",
                 )
                 self.assertGreater(attrs["heating_demand"], 0, "Heating demand should be positive")
                 self.assertEqual(

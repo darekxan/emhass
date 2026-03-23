@@ -396,7 +396,7 @@ def calculate_dual_thermal_demand(
 
     - **Heating demand**: max(load - solar_gains - internal_gains, 0)
     - **Cooling demand**: max(load + solar_gains + internal_gains, 0)
-    - **Thermal balance**: heating_demand - cooling_demand (positive = heating need, negative = cooling need)
+    - **Thermal balance**: cooling_demand - heating_demand (positive = cooling need, negative = heating need)
 
     :param u_value: Thermal transmittance of envelope (W/m²K)
     :type u_value: float
@@ -423,7 +423,7 @@ def calculate_dual_thermal_demand(
     :param internal_gains_factor: Scaling factor for internal gains (0-1), defaults to 0.0
     :type internal_gains_factor: float, optional
     :return: Dictionary with keys: "heating_load_kwh", "cooling_load_kwh", "solar_gains_kwh", \
-        "internal_gains_kwh", "thermal_balance_kwh" (positive = heating need, negative = cooling need)
+        "internal_gains_kwh", "thermal_balance_kwh" (positive = cooling need, negative = heating need)
     :rtype: dict[str, np.ndarray]
 
     """
@@ -508,10 +508,10 @@ def calculate_dual_thermal_demand(
     heating_demand_kwh = np.maximum(heating_load_kwh - solar_gains_kwh - internal_gains_kwh, 0.0)
     cooling_demand_kwh = np.maximum(cooling_load_kwh + solar_gains_kwh + internal_gains_kwh, 0.0)
 
-    # Unified thermal balance: positive = heating need, negative = cooling need
+    # Unified thermal balance: positive = cooling need, negative = heating need.
     # Since heating_demand and cooling_demand are mutually exclusive (at most one nonzero
     # per timestep), this signed balance is lossless.
-    thermal_balance_kwh = heating_demand_kwh - cooling_demand_kwh
+    thermal_balance_kwh = cooling_demand_kwh - heating_demand_kwh
 
     return {
         "heating_load_kwh": heating_load_kwh,
@@ -1306,7 +1306,7 @@ async def treat_runtimeparams(
                 "friendly_name": f"Solar gain {k}",
             }
         )
-        # Unified signed thermal balance (positive = heating need, negative = cooling need).
+        # Unified signed thermal balance (positive = cooling need, negative = heating need).
         # Used for dual-mode loads; single-mode loads use custom_heating_demand_id above.
         custom_thermal_balance_id.append(
             {

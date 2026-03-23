@@ -83,11 +83,11 @@ async def publish_unified_thermal_data(
 
             # Create attributes with additional metadata
             attributes = {
-                "heating_demand": thermal_balance.clip(lower=0).iloc[0],
-                "cooling_demand": (-thermal_balance.clip(upper=0)).iloc[0],
-                "mode": "heating"
+                "heating_demand": (-thermal_balance.clip(upper=0)).iloc[0],
+                "cooling_demand": thermal_balance.clip(lower=0).iloc[0],
+                "mode": "cooling"
                 if thermal_balance.iloc[0] > 0
-                else "cooling"
+                else "heating"
                 if thermal_balance.iloc[0] < 0
                 else "idle",
                 "forecast": thermal_balance.iloc[1:].tolist(),
