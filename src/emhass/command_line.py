@@ -2187,13 +2187,15 @@ async def _publish_thermal_variable(
 
 
 async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
-    """Publish predicted temperature and heating demand for thermal loads."""
+    """Publish predicted temperature, heating demand, and cooling mode for thermal loads."""
     cols = []
     if "custom_predicted_temperature_id" not in ctx.params["passed_data"]:
         return cols
     custom_temp = ctx.params["passed_data"]["custom_predicted_temperature_id"]
     custom_heat = ctx.params["passed_data"].get("custom_heating_demand_id")
     custom_solar = ctx.params["passed_data"].get("custom_solar_gain_id")
+    custom_cool = ctx.params["passed_data"].get("custom_cooling_demand_id")
+    custom_thermal_mode = ctx.params["passed_data"].get("custom_thermal_mode_id")
     def_load_config = ctx.optim_conf.get("def_load_config", [])
     if not isinstance(def_load_config, list):
         def_load_config = []
@@ -2242,6 +2244,46 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         )
         if col_s:
             cols.append(col_s)
+        # Publish cooling demand for dual-mode thermal batteries
+        col_c = await _publish_thermal_variable(
+            ctx.rh,
+            opt_res_latest,
+            ctx.idx,
+            k,
+            custom_cool,
+            "cooling_demand_heater",
+            "energy",
+            "energy",
+            ctx.common_kwargs,
+        )
+        if col_c:
+            cols.append(col_c)
+        # Publish thermal mode (0=off, 1=heating, 2=cooling) for dual-mode thermal batteries
+        if custom_thermal_mode and k < len(custom_thermal_mode):
+            # Construct thermal mode: 0=off, 1=heating, 2=cooling
+            # Use heat_active and cool_active columns if available
+            heat_active_col = f"heat_active{k}"
+            cool_active_col = f"cool_active{k}"
+            if (
+                heat_active_col in opt_res_latest.columns
+                and cool_active_col in opt_res_latest.columns
+            ):
+                heat_active = opt_res_latest[heat_active_col].astype(int)
+                cool_active = opt_res_latest[cool_active_col].astype(int)
+                # thermal_mode: 0 = off, 1 = heating (heat_active=1), 2 = cooling (cool_active=1)
+                thermal_mode = heat_active * 1 + cool_active * 2
+                entity_conf = custom_thermal_mode[k]
+                await ctx.rh.post_data(
+                    thermal_mode,
+                    ctx.idx,
+                    entity_conf["entity_id"],
+                    "thermal_mode",
+                    entity_conf["unit_of_measurement"],
+                    entity_conf["friendly_name"],
+                    type_var="thermal_mode",
+                    **ctx.common_kwargs,
+                )
+                cols.append(f"thermal_mode_heater{k}")
     return cols
 
 

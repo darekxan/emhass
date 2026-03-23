@@ -1717,8 +1717,8 @@ class Optimization:
             self.vars[f"heat_active_{k}"] = heat_active
             self.vars[f"cool_active_{k}"] = cool_active
 
-            # Link p_deferrable to net power: p_deferrable = p_heat - p_cool
-            constraints.append(p_deferrable == p_heat - p_cool)
+            # Link p_deferrable to net power: sum of heating + cooling electrical loads
+            constraints.append(p_deferrable == p_heat + p_cool)
 
             # Nominal power for semi-continuous constraints
             nominal_power = self.optim_conf["nominal_power_of_deferrable_loads"][k]
