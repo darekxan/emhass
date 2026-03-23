@@ -992,6 +992,8 @@ async def treat_runtimeparams(
     custom_predicted_temperature_id = []
     custom_heating_demand_id = []
     custom_solar_gain_id = []
+    custom_cooling_demand_id = []
+    custom_thermal_mode_id = []
     for k in range(params["optim_conf"]["number_of_deferrable_loads"]):
         custom_deferrable_forecast_id.append(
             {
@@ -1023,6 +1025,22 @@ async def treat_runtimeparams(
                 "device_class": "energy",
                 "unit_of_measurement": "kWh",
                 "friendly_name": f"Solar gain {k}",
+            }
+        )
+        custom_cooling_demand_id.append(
+            {
+                "entity_id": f"sensor.cooling_demand{k}",
+                "device_class": "energy",
+                "unit_of_measurement": "kWh",
+                "friendly_name": f"Cooling demand {k}",
+            }
+        )
+        custom_thermal_mode_id.append(
+            {
+                "entity_id": f"sensor.thermal_mode_heater{k}",
+                "device_class": "enum",
+                "unit_of_measurement": "",
+                "friendly_name": f"Thermal Mode {k}",
             }
         )
     default_passed_dict = {
@@ -1095,7 +1113,9 @@ async def treat_runtimeparams(
         "custom_deferrable_forecast_id": custom_deferrable_forecast_id,
         "custom_predicted_temperature_id": custom_predicted_temperature_id,
         "custom_heating_demand_id": custom_heating_demand_id,
+        "custom_cooling_demand_id": custom_cooling_demand_id,
         "custom_solar_gain_id": custom_solar_gain_id,
+        "custom_thermal_mode_id": custom_thermal_mode_id,
         "publish_prefix": "",
     }
     if "passed_data" in params.keys():
@@ -1684,6 +1704,14 @@ async def treat_runtimeparams(
             ]
         if "custom_solar_gain_id" in runtimeparams.keys():
             params["passed_data"]["custom_solar_gain_id"] = runtimeparams["custom_solar_gain_id"]
+        if "custom_cooling_demand_id" in runtimeparams.keys():
+            params["passed_data"]["custom_cooling_demand_id"] = runtimeparams[
+                "custom_cooling_demand_id"
+            ]
+        if "custom_thermal_mode_id" in runtimeparams.keys():
+            params["passed_data"]["custom_thermal_mode_id"] = runtimeparams[
+                "custom_thermal_mode_id"
+            ]
 
     # split config categories from params
     retrieve_hass_conf = params["retrieve_hass_conf"]
