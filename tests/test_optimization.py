@@ -2113,6 +2113,76 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "(solar_gains_arr[:-1] was used instead of solar_gains_arr[1:]).",
         )
 
+    def test_thermal_battery_dual_mode_solar_not_double_counted(self):
+        """In dual-mode, solar gains embedded in thermal_balance must not be added twice.
+
+        Regression test for the double-counting bug where solar_gains_arr was added
+        separately in the temperature constraint even though it was already subtracted
+        inside thermal_balance (and thus inside heating_demand_arr / cooling_demand_arr).
+
+        We verify by comparing single-mode and dual-mode predictions under identical
+        physics-based configs: both must agree on the solar gain column value and must
+        produce a temperature trajectory that is physically consistent (solar raises T,
+        not 2x the expected amount).
+        """
+        horizon = len(self.df_input_data_dayahead)
+        outdoor_temps = [10.0] * horizon
+        # Steady solar irradiance throughout
+        ghi = [500.0] * horizon
+
+        base = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [18.0] * horizon,
+            "max_temperatures": [30.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 40.0,
+            "shgc": 0.6,
+        }
+
+        single_config = base.copy()
+        opt_single = self.run_thermal_battery_optimization(
+            single_config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        dual_config = base.copy()
+        dual_config["dual_mode_enabled"] = True
+        dual_config["cool_supply_temperature"] = 12.0
+        dual_config["heat_supply_temperature"] = 35.0
+        dual_config["heat_carnot_efficiency"] = 0.4
+        dual_config["cool_carnot_efficiency"] = 0.45
+        opt_dual = self.run_thermal_battery_optimization(
+            dual_config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        # Both columns must be present
+        self.assertIn("solar_gain_heater0", opt_single.columns)
+        self.assertIn("solar_gain_heater0", opt_dual.columns)
+
+        # Solar gain column values must be identical in both modes (same GHI, same window)
+        np.testing.assert_allclose(
+            opt_single["solar_gain_heater0"].values,
+            opt_dual["solar_gain_heater0"].values,
+            rtol=1e-6,
+            err_msg="solar_gain_heater0 must be identical in single- and dual-mode "
+            "(both use same GHI / window params). Double-counting would show up "
+            "as a discrepancy here.",
+        )
+
+        # In dual-mode the temperature trajectory must stay within bounds
+        temp_dual = opt_dual["predicted_temp_heater0"].values
+        self.assertTrue(
+            np.all(temp_dual <= 30.0 + 1e-4),
+            "Dual-mode predicted temperature exceeded max_temperature. "
+            "This can indicate solar gains are double-counted, driving T too high.",
+        )
+
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.
 

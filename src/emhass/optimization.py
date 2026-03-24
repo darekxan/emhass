@@ -2255,6 +2255,10 @@ class Optimization:
             # interval [t, t+1]), which is already known from the day-ahead forecast.  This
             # allows the optimizer to anticipate passive solar heating and reduce heat-pump
             # output during the solar peak rather than one timestep after it.
+            #
+            # Dual-mode note: in dual-mode heating_demand_arr / cooling_demand_arr are derived
+            # from thermal_balance which already has solar gains subtracted.  solar_gains_arr
+            # must NOT be added again here — doing so would double-count the solar contribution.
             if dual_mode_enabled and cooling_demand_arr is not None:
                 constraints.append(
                     predicted_temp_thermal[1:]
@@ -2262,7 +2266,6 @@ class Optimization:
                     + conversion
                     * (
                         q_input[:-1]
-                        + solar_gains_arr[:-1]
                         - heating_demand_arr[:-1]
                         + cooling_demand_arr[:-1]
                         - thermal_losses_arr[:-1]
@@ -2290,6 +2293,9 @@ class Optimization:
             #
             # Timing note: solar_gains_arr[1:] uses GHI at t+1 so the optimizer can act
             # on incoming solar gain during the current interval rather than one step late.
+            #
+            # Dual-mode note: solar gains are already embedded in thermal_balance (and thus
+            # in heating_demand_arr / cooling_demand_arr).  Do not add solar_gains_arr again.
             if dual_mode_enabled and p_cool is not None and cool_cops_arr is not None:
                 # Dual-mode: heating effect - cooling effect
                 constraints.append(
@@ -2299,7 +2305,6 @@ class Optimization:
                     * (
                         (cp.multiply(heat_cops_arr[:-1], p_heat[:-1]) / 1000 * self.time_step)
                         - (cp.multiply(cool_cops_arr[:-1], p_cool[:-1]) / 1000 * self.time_step)
-                        + solar_gains_arr[:-1]
                         - heating_demand_arr[:-1]
                         + cooling_demand_arr[:-1]
                         - thermal_losses_arr[:-1]
