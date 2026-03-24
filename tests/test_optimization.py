@@ -2035,6 +2035,84 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # the feature is working. The optimizer may choose not to heat if solar gains fully
         # offset heating demand and the thermal battery remains within temperature bounds.
 
+    def test_thermal_battery_solar_gains_timing_not_one_step_late(self):
+        """Solar gains must affect the predicted temperature at the same timestep, not one step late.
+
+        Regression test for the timing bug where solar_gains_arr[:-1] (GHI at t) was used to
+        compute T[t+1], making the optimizer respond to solar one full timestep after the peak.
+        The fix uses solar_gains_arr[1:] so GHI at t+1 is accounted for in T[t+1].
+
+        We verify this by running a short optimisation with a step-function GHI that turns on
+        at step 1 (index 1) and checking that predicted_temp already reflects the gain by step 1
+        (i.e. T[1] > T[0]) rather than only at step 2.
+        """
+        horizon = len(self.df_input_data_dayahead)
+        # Cold flat outdoor temp — building would cool without gains
+        outdoor_temps = [5.0] * horizon
+        # GHI = 0 at step 0, then large constant value from step 1 onwards
+        ghi = [0.0] + [800.0] * (horizon - 1)
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [0.0] * horizon,  # loose — don't force heating
+            "max_temperatures": [50.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 60.0,
+            "shgc": 0.7,
+        }
+
+        opt_res = self.run_thermal_battery_optimization(
+            config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        solar_gain_col = opt_res["solar_gain_heater0"].values
+
+        # Solar gains must be non-zero from step 1 onwards in the output column
+        self.assertGreater(
+            solar_gain_col[1],
+            0.0,
+            "solar_gain_heater0 must be non-zero at step 1 when GHI turns on at step 1",
+        )
+
+        # Run the no-solar baseline for comparison
+        config_no_solar = {k: v for k, v in config.items() if k not in ("window_area", "shgc")}
+        opt_res_no_solar = self.run_thermal_battery_optimization(
+            config_no_solar, outdoor_temps=outdoor_temps
+        )
+
+        temp_solar = opt_res["predicted_temp_heater0"].values
+        temp_no_solar = opt_res_no_solar["predicted_temp_heater0"].values
+
+        # From step 1 onwards the solar variant must be warmer (or equal) to the no-solar case
+        for step in range(1, min(6, horizon)):
+            self.assertGreaterEqual(
+                temp_solar[step],
+                temp_no_solar[step] - 1e-6,
+                f"At step {step} solar variant (T={temp_solar[step]:.3f}) should be >= "
+                f"no-solar variant (T={temp_no_solar[step]:.3f}). "
+                "Solar gains are influencing temperature too late (off-by-one regression).",
+            )
+
+        # Confirm the solar effect is already visible at step 1 (not only from step 2 onward).
+        # With GHI[0]=0 and GHI[1..N]=800:
+        #   Fixed code  (solar_gains_arr[1:]): T[1] uses GHI[1] → non-zero effect at step 1
+        #   Buggy code  (solar_gains_arr[:-1]): T[1] uses GHI[0]=0 → zero effect at step 1
+        solar_effect_step1 = temp_solar[1] - temp_no_solar[1]
+        self.assertGreater(
+            solar_effect_step1,
+            1e-6,
+            "Solar gain effect must be non-zero at step 1 when GHI turns on at step 1. "
+            "A zero effect here means the off-by-one timing regression is present "
+            "(solar_gains_arr[:-1] was used instead of solar_gains_arr[1:]).",
+        )
+
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.
 
