@@ -220,6 +220,51 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             input_data_dict["fcst"].optim_conf["production_price_forecast_method"], "list"
         )
 
+    async def test_set_input_data_dict_accepts_dict_forecasts_for_naive_mpc(self):
+        """Dict-based runtime forecasts should be normalized for naive MPC input setup."""
+        costfun = "profit"
+        action = "naive-mpc-optim"
+        params = await TestCommandLineAsyncUtils.get_test_params(set_use_pv=True)
+
+        optimization_time_step = params["retrieve_hass_conf"]["optimization_time_step"]
+        time_zone = params["retrieve_hass_conf"]["time_zone"]
+        forecast_dates = utils.get_forecast_dates(optimization_time_step, 1, time_zone)[:4]
+
+        def _build_forecast_dict(values):
+            return dict(zip(forecast_dates, values, strict=False))
+
+        runtimeparams = {
+            "prediction_horizon": 4,
+            "pv_power_forecast": _build_forecast_dict([100.0, 200.0, 300.0, 400.0]),
+            "load_power_forecast": _build_forecast_dict([500.0, 600.0, 700.0, 800.0]),
+            "load_cost_forecast": _build_forecast_dict([0.3, 0.31, 0.32, 0.33]),
+            "prod_price_forecast": _build_forecast_dict([0.2, 0.21, 0.22, 0.23]),
+        }
+        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+        params["passed_data"] = runtimeparams
+        params_json = orjson.dumps(params).decode("utf-8")
+
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            costfun,
+            params_json,
+            runtimeparams_json,
+            action,
+            logger,
+            get_data_from_file=True,
+        )
+
+        self.assertIsInstance(input_data_dict, dict)
+        self.assertIsInstance(input_data_dict["df_input_data_dayahead"], pd.DataFrame)
+        self.assertEqual(len(input_data_dict["df_input_data_dayahead"]), 4)
+        self.assertEqual(input_data_dict["df_input_data_dayahead"].isnull().sum().sum(), 0)
+        self.assertEqual(input_data_dict["fcst"].optim_conf["weather_forecast_method"], "list")
+        self.assertEqual(input_data_dict["fcst"].optim_conf["load_forecast_method"], "list")
+        self.assertEqual(input_data_dict["fcst"].optim_conf["load_cost_forecast_method"], "list")
+        self.assertEqual(
+            input_data_dict["fcst"].optim_conf["production_price_forecast_method"], "list"
+        )
+
     # Test day-ahead optimization
     async def test_webserver_get_injection_dict(self):
         costfun = "profit"
