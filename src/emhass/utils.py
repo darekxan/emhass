@@ -112,6 +112,7 @@ def get_forecast_dates(
     delta_forecast: int,
     time_zone: datetime.tzinfo,
     timedelta_days: int | None = 0,
+    method_ts_round: str | None = "first",
 ) -> pd.core.indexes.datetimes.DatetimeIndex:
     """
     Get the date_range list of the needed future dates using the delta_forecast parameter.
@@ -122,6 +123,8 @@ def get_forecast_dates(
     :type delta_forecast: int
     :param timedelta_days: Number of truncated days needed for each optimization iteration, defaults to 0
     :type timedelta_days: Optional[int], optional
+    :param method_ts_round: Timestamp rounding mode, defaults to "first"
+    :type method_ts_round: Optional[str], optional
     :return: A list of future forecast dates.
     :rtype: pd.core.indexes.datetimes.DatetimeIndex
 
@@ -129,15 +132,24 @@ def get_forecast_dates(
     freq = pd.to_timedelta(freq, "minutes")
     start_time = _get_now()
 
-    start_forecast = pd.Timestamp(start_time, tz=time_zone).replace(microsecond=0).floor(freq=freq)
-    end_forecast = start_forecast + pd.tseries.offsets.DateOffset(days=delta_forecast)
-    final_end_date = end_forecast + pd.tseries.offsets.DateOffset(days=timedelta_days) - freq
+    start_forecast = pd.Timestamp(start_time, tz=time_zone).replace(microsecond=0)
+    if method_ts_round == "first":
+        start_forecast = start_forecast.floor(freq=freq)
+    elif method_ts_round == "last":
+        start_forecast = start_forecast.ceil(freq=freq)
+    end_forecast = start_forecast + pd.Timedelta(days=delta_forecast)
+    final_end_date = end_forecast + pd.Timedelta(days=timedelta_days) - freq
 
-    forecast_dates = pd.date_range(
-        start=start_forecast,
-        end=final_end_date,
-        freq=freq,
-        tz=time_zone,
+    forecast_dates = (
+        pd.date_range(
+            start=start_forecast,
+            end=final_end_date,
+            freq=freq,
+            tz=time_zone,
+        )
+        .tz_convert("utc")
+        .round(freq, ambiguous="infer", nonexistent="shift_forward")
+        .tz_convert(time_zone)
     )
 
     return [ts.isoformat() for ts in forecast_dates]
@@ -1486,7 +1498,12 @@ async def treat_runtimeparams(
         else:
             time_zone = params["retrieve_hass_conf"]["time_zone"]
 
-        forecast_dates = get_forecast_dates(optimization_time_step, delta_forecast, time_zone)
+        forecast_dates = get_forecast_dates(
+            optimization_time_step,
+            delta_forecast,
+            time_zone,
+            method_ts_round=params["retrieve_hass_conf"]["method_ts_round"],
+        )
 
         # Add runtime exclusive (not in config) parameters to params
         # regressor-model-fit
