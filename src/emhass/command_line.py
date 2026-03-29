@@ -2064,8 +2064,15 @@ def _load_opt_res_latest(
         logger.error("File not found error, run an optimization task first.")
         return None
     opt_res_latest = pd.read_csv(file_path, index_col="timestamp")
-    opt_res_latest.index = pd.to_datetime(opt_res_latest.index)
-    opt_res_latest.index.freq = input_data_dict["retrieve_hass_conf"]["optimization_time_step"]
+    opt_res_latest.index = pd.to_datetime(opt_res_latest.index, utc=True).tz_convert(
+        input_data_dict["retrieve_hass_conf"]["time_zone"]
+    )
+    try:
+        opt_res_latest.index.freq = input_data_dict["retrieve_hass_conf"]["optimization_time_step"]
+    except (TypeError, ValueError):
+        logger.warning(
+            "Unable to assign optimization_time_step as index frequency for opt_res_latest"
+        )
     return opt_res_latest
 
 

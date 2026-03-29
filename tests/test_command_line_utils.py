@@ -20,6 +20,7 @@ from emhass.command_line import (
     OptimizationCache,
     OptimizationCacheKey,
     SetupContext,
+    _load_opt_res_latest,
     _prepare_dayahead_optim,
     _publish_and_update_freq,
     adjust_pv_forecast,
@@ -1028,6 +1029,44 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         ):
             opt_res = await main()
             self.assertFalse(opt_res.empty)
+
+    def test_load_opt_res_latest_accepts_mixed_dst_offsets(self):
+        params = orjson.loads(self.params_json)
+        time_zone = params["retrieve_hass_conf"]["time_zone"]
+        optimization_time_step = pd.to_timedelta(
+            params["retrieve_hass_conf"]["optimization_time_step"], "minutes"
+        )
+        mixed_dst_index = [
+            "2026-10-25T02:00:00+02:00",
+            "2026-10-25T02:00:00+01:00",
+            "2026-10-25T03:00:00+01:00",
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = pathlib.Path(tmpdir)
+            pd.DataFrame(
+                {
+                    "timestamp": mixed_dst_index,
+                    "P_PV": [1.0, 2.0, 3.0],
+                    "P_Load": [4.0, 5.0, 6.0],
+                    "optim_status": ["Optimal", "Optimal", "Optimal"],
+                }
+            ).to_csv(data_path / "opt_res_latest.csv", index=False)
+            input_data_dict = {
+                "emhass_conf": {"data_path": data_path},
+                "retrieve_hass_conf": {
+                    "time_zone": time_zone,
+                    "optimization_time_step": optimization_time_step,
+                },
+            }
+
+            opt_res_latest = _load_opt_res_latest(input_data_dict, logger, save_data_to_file=False)
+
+        self.assertIsInstance(opt_res_latest.index, pd.DatetimeIndex)
+        self.assertEqual(str(opt_res_latest.index.tz), time_zone)
+        self.assertEqual(len(opt_res_latest), 3)
+        self.assertEqual(opt_res_latest.index[0].utcoffset(), timedelta(hours=2))
+        self.assertEqual(opt_res_latest.index[1].utcoffset(), timedelta(hours=1))
+        self.assertIsNone(opt_res_latest.index.freq)
 
     # Test export_influxdb_to_csv
     async def test_export_influxdb_to_csv(self):
