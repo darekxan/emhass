@@ -1080,6 +1080,20 @@ class Optimization:
                     term = -scale * penalty * nominal_power * total_startup_cost
                     objective_terms.append(term)
 
+        # Deferrable Load Running Overhead
+        # A static per-timestep penalty (in W) for each timestep a load is active.
+        # This makes connection time costly, biasing the solver toward fewer,
+        # higher-power (shorter) charging sessions.
+        running_overhead = self.optim_conf.get("set_deferrable_load_running_overhead", [])
+        if running_overhead:
+            p_def_bin2 = self.vars["p_def_bin2"]
+            for k in range(self.optim_conf["number_of_deferrable_loads"]):
+                overhead = running_overhead[k] if k < len(running_overhead) else 0.0
+                if overhead <= 0 or k >= len(p_def_bin2):
+                    continue
+                overhead_cost = cp.multiply(p_def_bin2[k], unit_load_cost)
+                objective_terms.append(-scale * overhead * cp.sum(overhead_cost))
+
         # Stress Costs
         # These variables represent a cost to be minimized.
         # Since we are Maximizing the objective, we subtract them.
@@ -2590,6 +2604,8 @@ class Optimization:
                 "set_deferrable_startup_penalty" in self.optim_conf
                 and self.optim_conf["set_deferrable_startup_penalty"][k] > 0
             )
+            _running_overhead_list = self.optim_conf.get("set_deferrable_load_running_overhead", [])
+            has_running_overhead = k < len(_running_overhead_list) and _running_overhead_list[k] > 0
 
             # Check if we MUST use binary logic
             use_binary_logic = (
@@ -2598,6 +2614,7 @@ class Optimization:
                 or is_single_const
                 or has_min_power
                 or has_startup_penalty
+                or has_running_overhead
             )
 
             if use_binary_logic:

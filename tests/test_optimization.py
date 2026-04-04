@@ -1429,6 +1429,39 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             check_names=False,
         )
 
+    def test_running_overhead_compresses_active_timesteps(self):
+        """Running overhead should bias the solver toward fewer, higher-power timesteps.
+
+        With minimum_power = 50% of nominal and an energy requirement that can be met
+        by either 5 timesteps at nominal or 10 timesteps at min_power, a non-zero
+        running overhead should push the solver to choose the 5-timestep solution.
+        """
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        min_power = nominal * 0.5
+
+        self.fcst.params["passed_data"]["load_cost_forecast"] = [1.0] * 10
+        self.optim_conf.update(
+            {
+                "minimum_power_of_deferrable_loads": [min_power],
+                # Overhead equal to nominal: each extra active timestep costs as much
+                # as drawing nominal power for that step, strongly favouring fewer steps.
+                "set_deferrable_load_running_overhead": [nominal],
+            }
+        )
+
+        self.run_penalty_test_forecast()
+
+        schedule = self.opt_res_dayahead["P_deferrable0"]
+        active_timesteps = (schedule > 0).sum()
+
+        # Energy requirement (5 timesteps × nominal) can be met exactly in 5 steps
+        # at nominal power; using more steps at min_power incurs more overhead cost.
+        self.assertLessEqual(
+            active_timesteps,
+            5,
+            f"Expected ≤5 active timesteps with high running overhead, got {active_timesteps}",
+        )
+
     def test_perform_naive_mpc_optim_def_total_timestep(self):
         """Test operating_timesteps_of_each_deferrable_load parameter.
 
