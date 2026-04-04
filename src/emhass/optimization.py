@@ -234,6 +234,21 @@ class Optimization:
             p = cp.Parameter(nonneg=True, name=f"load_active_{k}")
             p.value = 1.0  # Default: all loads active
             self.param_load_active.append(p)
+
+        # Minimum power parameters: allow updating min-power values on cached problems
+        # without rebuilding the CVXPY problem structure. The structural decision
+        # (has_min_power / binary logic) is still made at build time from optim_conf.
+        min_power_init = self.optim_conf.get(
+            "minimum_power_of_deferrable_loads", [0.0] * num_def_loads
+        )
+        if min_power_init is None or len(min_power_init) < num_def_loads:
+            min_power_init = (list(min_power_init or []) + [0.0] * num_def_loads)[:num_def_loads]
+        self.param_min_power = []
+        for k in range(num_def_loads):
+            p = cp.Parameter(nonneg=True, name=f"min_power_{k}")
+            p.value = float(min_power_init[k])
+            self.param_min_power.append(p)
+
         # Thermal Parameters for warm-starting
         # Dict keyed by load index k, stores all parameters needed for thermal constraints
         # This allows updating runtime values (forecasts, temperatures) without rebuilding constraints
@@ -2597,9 +2612,7 @@ class Optimization:
 
                 # Minimum Power (if active)
                 if has_min_power:
-                    constraints.append(
-                        p_deferrable[k] >= min_power_of_deferrable_loads[k] * p_def_bin2[k]
-                    )
+                    constraints.append(p_deferrable[k] >= self.param_min_power[k] * p_def_bin2[k])
 
                 # Status consistency: P_def <= M * Bin2
                 # Use the Dynamic M calculated above (Critical for performance)
@@ -3119,6 +3132,10 @@ class Optimization:
                 self.logger.debug(
                     f"Deferrable load {k}: deactivated (no operating timesteps, not thermal)"
                 )
+
+        # Update min-power parameters so cached problems use the current call's values
+        for k in range(min(num_deferrable_loads, len(self.param_min_power))):
+            self.param_min_power[k].value = float(min_power_of_deferrable_loads[k])
 
         # Update def_current_state parameters for deferrable loads
         self._update_def_current_state_params(num_deferrable_loads)

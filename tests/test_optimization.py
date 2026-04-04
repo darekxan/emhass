@@ -517,6 +517,39 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                     f"Invalid values found: {non_zero_powers[non_zero_powers < min_power_k].tolist()}",
                 )
 
+    def test_perform_dayahead_forecast_optim_min_def_load_power_cache_hit(self):
+        """Min-power values must be honoured on the second call (cache hit)."""
+        # First call: build the problem with an initial min power
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [500.0, 100.0]
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+
+        # Second call: change min power — the cached problem should pick up the new value
+        new_min_powers = [1500.0, 300.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = new_min_powers
+        # Also update the Optimization object's optim_conf so perform_optimization
+        # reads the new values when min_power_of_deferrable_loads is not passed explicitly
+        self.opt.optim_conf["minimum_power_of_deferrable_loads"] = new_min_powers
+        result = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+
+        self.assertIsInstance(result, type(pd.DataFrame()))
+        num_loads = self.optim_conf["number_of_deferrable_loads"]
+        for k in range(num_loads):
+            power_column = result[f"P_deferrable{k}"]
+            non_zero_powers = power_column[~np.isclose(power_column, 0)]
+            if not non_zero_powers.empty:
+                self.assertTrue(
+                    (non_zero_powers >= new_min_powers[k]).all(),
+                    f"Cache-hit: deferrable load {k} has values below the updated min power "
+                    f"{new_min_powers[k]} W. Values: "
+                    f"{non_zero_powers[non_zero_powers < new_min_powers[k]].tolist()}",
+                )
+
     def test_perform_naive_mpc_optim(self):
         self.df_input_data_dayahead = self.prepare_forecast_data()
         # Test the battery
