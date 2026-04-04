@@ -1680,7 +1680,7 @@ async def treat_runtimeparams(
         for method, forecast_key in enumerate(list_forecast_key):
             if forecast_key in runtimeparams.keys():
                 forecast_input = runtimeparams[forecast_key]
-                if isinstance(forecast_input, dict):
+                if isinstance(forecast_input, dict) and len(forecast_input) > 0:
                     forecast_data_df = pd.DataFrame.from_dict(
                         forecast_input, orient="index"
                     ).reset_index()

@@ -266,6 +266,33 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             input_data_dict["fcst"].optim_conf["production_price_forecast_method"], "list"
         )
 
+    async def test_set_input_data_dict_empty_dict_forecast_does_not_crash(self):
+        """An empty dict passed for a forecast key must not raise a ValueError."""
+        costfun = "profit"
+        action = "naive-mpc-optim"
+        params = await TestCommandLineAsyncUtils.get_test_params(set_use_pv=True)
+
+        runtimeparams = {
+            "prediction_horizon": 4,
+            "load_power_forecast": {},  # empty dict — should be silently skipped
+        }
+        runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
+        params["passed_data"] = runtimeparams
+        params_json = orjson.dumps(params).decode("utf-8")
+
+        # Must not raise ValueError: Length mismatch
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            costfun,
+            params_json,
+            runtimeparams_json,
+            action,
+            logger,
+            get_data_from_file=True,
+        )
+
+        self.assertIsInstance(input_data_dict, dict)
+
     # Test day-ahead optimization
     async def test_webserver_get_injection_dict(self):
         costfun = "profit"
