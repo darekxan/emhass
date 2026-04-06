@@ -69,15 +69,34 @@ The LP in `optimization.py` handles:
 - Deferrable loads (on/off scheduling with minimum runtime)
 - Thermal battery (heating/cooling with building physics)
 - Cost minimization or profit maximization objective
+- **Billing-window netting** (`netting_window_time_steps > 1`): groups consecutive timesteps into billing windows and nets grid import vs. export within each window before pricing (e.g. Polish OZE prosumer regulations). Adds `P_autoconsumption` column to results.
+- **Deferrable load running overhead** (`set_deferrable_load_running_overhead`): per-load static cost (W) penalizing each active timestep, biasing LP toward fewer/longer run sessions.
 
 Thermal extensions live in `optimization_unified_thermal.py` using a signed thermal balance model (positive = heating, negative = cooling).
+
+### CVXPY Parameters vs. Structural Decisions
+
+Some optimization inputs are stored as `cp.Parameter` objects (mutable at solve-time without rebuilding the problem) rather than Python constants. This is critical for cache compatibility — changing a `cp.Parameter` value keeps the warm-start cache valid, while changing a structural decision (e.g. number of loads, boolean constraints) invalidates it.
+
+Current `cp.Parameter` items:
+- `param_min_power` — per-load minimum power (`minimum_power_of_deferrable_loads`)
+
+When adding new tunable knobs, prefer `cp.Parameter` over rebuilding the CVXPY problem if the constraint graph shape doesn't change.
 
 ### Configuration
 
 - `src/emhass/data/config_defaults.json` — canonical defaults for all parameters
 - `src/emhass/data/associations.csv` — maps parameter names to config categories
+- `src/emhass/data/unified_thermal_schema.json` — JSON schema for thermal balance configurations
 - `options.json` — Home Assistant add-on runtime config (hass_url, token, location)
 - `secrets_emhass.yaml` — secrets for standalone/Docker deployment
+
+Notable recent parameters:
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `netting_window_time_steps` | 1 | Sub-hourly billing window size; >1 enables per-window net import/export pricing |
+| `set_deferrable_load_running_overhead` | [0.0, …] | Per-load W cost penalizing each active timestep |
+| `minimum_power_of_deferrable_loads` | [0.0, …] | Per-load minimum power when active (now a `cp.Parameter`) |
 
 ### Test Structure
 
@@ -91,6 +110,8 @@ Tests use `unittest.mock` (AsyncMock, MagicMock, patch) and `aioresponses` for a
 - **Line length**: 100 chars (Ruff-enforced). Run `ruff check --fix src/` before committing.
 - **Immutability**: Cache keys use `@dataclass(frozen=True)` so they are hashable; do not store mutable state in them.
 - **Commit style**: `feat:`, `fix:`, `refactor:`, `perf:`, `docs:`, `test:` conventional commits.
+- **Per-load list parameters**: When adding a new per-load parameter, use `check_def_loads()` in `utils.treat_runtimeparams()` to validate the list length matches `number_of_deferrable_loads`.
+- **ML forecaster horizon**: Pass `prediction_horizon` in the runtime payload to control the number of forecast steps returned by `forecast_model_predict`. It is forwarded as `steps` to `MLForecaster.predict()`.
 
 ## CI/CD
 
@@ -117,3 +138,6 @@ GitHub Actions workflows in `.github/workflows/`:
 | Add thermal constraints | `optimization_unified_thermal.py` |
 | Add regression tests | `tests/test_command_line_utils.py` or `tests/test_optimization.py` |
 | Debug HA connectivity | `retrieve_hass.py` + `websocket_client.py` |
+| Add a per-load parameter | `config_defaults.json` + `associations.csv` + `utils.treat_runtimeparams()` (`check_def_loads()`) |
+| Make a param cache-friendly | Use `cp.Parameter` in `optimization.py`; assign `.value` before each solve |
+| Add billing-window netting logic | `optimization.py` — `_add_netting_window_constraints()` + objective section |
