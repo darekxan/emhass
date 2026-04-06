@@ -902,6 +902,8 @@ class Optimization:
         p_def_bin1 = []
         p_def_start = []
         p_def_bin2 = []
+        p_def_delta_plus = []
+        p_def_delta_minus = []
 
         for k in range(num_deferrable_loads):
             # Calculate Upper Bound
@@ -922,10 +924,16 @@ class Optimization:
             p_def_start.append(cp.Variable(n, boolean=True, name=f"p_def_start_{k}"))
             p_def_bin2.append(cp.Variable(n, boolean=True, name=f"p_def_bin2_{k}"))
 
+            # Auxiliary variables for absolute-value power-transition linearization
+            p_def_delta_plus.append(cp.Variable(n, nonneg=True, name=f"p_def_delta_plus_{k}"))
+            p_def_delta_minus.append(cp.Variable(n, nonneg=True, name=f"p_def_delta_minus_{k}"))
+
         vars_dict["p_deferrable"] = p_deferrable
         vars_dict["p_def_bin1"] = p_def_bin1
         vars_dict["p_def_start"] = p_def_start
         vars_dict["p_def_bin2"] = p_def_bin2
+        vars_dict["p_def_delta_plus"] = p_def_delta_plus
+        vars_dict["p_def_delta_minus"] = p_def_delta_minus
 
         # Binary indicators for Grid and Battery direction
         vars_dict["D"] = cp.Variable(n, boolean=True, name="D")
@@ -1138,6 +1146,21 @@ class Optimization:
                     continue
                 overhead_cost = cp.multiply(p_def_bin2[k], unit_load_cost)
                 objective_terms.append(-scale * overhead * cp.sum(overhead_cost))
+
+        # Deferrable Load Power Transition Cost
+        # Penalises |P[t] - P[t-1]| to discourage rapid power-level changes on
+        # continuous (non-semi-continuous) loads such as variable EV chargers.
+        # Uses the auxiliary delta_plus/delta_minus variables added in constraint building.
+        transition_costs = self.optim_conf.get("set_deferrable_load_transition_cost", [])
+        if transition_costs:
+            p_def_delta_plus = self.vars["p_def_delta_plus"]
+            p_def_delta_minus = self.vars["p_def_delta_minus"]
+            for k in range(self.optim_conf["number_of_deferrable_loads"]):
+                tc = transition_costs[k] if k < len(transition_costs) else 0.0
+                if tc <= 0:
+                    continue
+                total_transition = cp.sum(p_def_delta_plus[k] + p_def_delta_minus[k])
+                objective_terms.append(-scale * tc * total_transition)
 
         # Stress Costs
         # These variables represent a cost to be minimized.
@@ -2772,6 +2795,27 @@ class Optimization:
                 # Just bound by nominal power. No binary variables involved.
                 constraints.append(p_deferrable[k] >= 0)
                 constraints.append(p_deferrable[k] <= M)
+
+        # Power-transition cost constraints (absolute-value linearization)
+        # Penalises |P[t] - P[t-1]| to smooth continuous load profiles.
+        # Only added when set_deferrable_load_transition_cost[k] > 0.
+        transition_costs = self.optim_conf.get(
+            "set_deferrable_load_transition_cost",
+            [0.0] * self.optim_conf["number_of_deferrable_loads"],
+        )
+        p_def_delta_plus = self.vars["p_def_delta_plus"]
+        p_def_delta_minus = self.vars["p_def_delta_minus"]
+        for k in range(self.optim_conf["number_of_deferrable_loads"]):
+            tc = transition_costs[k] if k < len(transition_costs) else 0.0
+            if tc > 0:
+                # t=0: no previous step, fix deltas to zero
+                constraints.append(p_def_delta_plus[k][0] == 0)
+                constraints.append(p_def_delta_minus[k][0] == 0)
+                for t in range(1, n):
+                    constraints.append(
+                        p_deferrable[k][t] - p_deferrable[k][t - 1]
+                        == p_def_delta_plus[k][t] - p_def_delta_minus[k][t]
+                    )
 
         return predicted_temps, heating_demands, penalty_terms_total, q_inputs, solar_gains
 
