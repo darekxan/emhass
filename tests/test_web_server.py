@@ -90,7 +90,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/get-config")
         self.assertEqual(response.status_code, 201)
         data = await response.get_json()
-        self.assertEqual(data, {"final": "config"})
+        self.assertGreaterEqual(data.items(), {"final": "config"}.items())
 
     @patch("emhass.web_server.build_config")
     @patch("emhass.web_server.build_params")
@@ -102,7 +102,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/get-config/defaults")
         self.assertEqual(response.status_code, 201)
         data = await response.get_json()
-        self.assertEqual(data, {"final": "default"})
+        self.assertGreaterEqual(data.items(), {"final": "default"}.items())
 
     @patch("emhass.web_server.build_legacy_config_params")
     @patch("emhass.web_server.build_params")

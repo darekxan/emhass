@@ -87,7 +87,8 @@ class TestMLForecasterAsync(unittest.IsolatedAsyncioTestCase):
             config = await utils.build_config(
                 emhass_conf, logger, emhass_conf["defaults_path"], config_path
             )
-            params = await utils.build_params(emhass_conf, {}, config, logger)
+            _, secrets = await utils.build_secrets(emhass_conf, logger, no_response=True)
+            params = await utils.build_params(emhass_conf, secrets, config, logger)
             return params
         else:
             raise Exception(

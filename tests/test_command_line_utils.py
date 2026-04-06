@@ -272,9 +272,19 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         action = "naive-mpc-optim"
         params = await TestCommandLineAsyncUtils.get_test_params(set_use_pv=True)
 
+        optimization_time_step = params["retrieve_hass_conf"]["optimization_time_step"]
+        time_zone = params["retrieve_hass_conf"]["time_zone"]
+        forecast_dates = utils.get_forecast_dates(optimization_time_step, 1, time_zone)[:4]
+
+        def _build_forecast_dict(values):
+            return dict(zip(forecast_dates, values, strict=False))
+
         runtimeparams = {
             "prediction_horizon": 4,
+            "pv_power_forecast": _build_forecast_dict([100.0, 200.0, 300.0, 400.0]),
             "load_power_forecast": {},  # empty dict — should be silently skipped
+            "load_cost_forecast": _build_forecast_dict([0.3, 0.31, 0.32, 0.33]),
+            "prod_price_forecast": _build_forecast_dict([0.2, 0.21, 0.22, 0.23]),
         }
         runtimeparams_json = orjson.dumps(runtimeparams).decode("utf-8")
         params["passed_data"] = runtimeparams
