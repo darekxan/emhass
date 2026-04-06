@@ -1635,7 +1635,8 @@ async def forecast_model_predict(
         data_last_window = copy.deepcopy(input_data_dict["df_input_data"])
     else:
         data_last_window = None
-    predictions = await mlf.predict(data_last_window)
+    prediction_horizon = input_data_dict["params"]["passed_data"].get("prediction_horizon")
+    predictions = await mlf.predict(data_last_window, steps=prediction_horizon)
     # Publish data to a Home Assistant sensor
     model_predict_publish = input_data_dict["params"]["passed_data"]["model_predict_publish"]
     model_predict_entity_id = input_data_dict["params"]["passed_data"]["model_predict_entity_id"]

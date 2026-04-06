@@ -321,6 +321,7 @@ class MLForecaster:
     async def predict(
         self,
         data_last_window: pd.DataFrame | None = None,
+        steps: int | None = None,
     ) -> pd.Series:
         """The predict method to generate forecasts from a previously fitted ML model.
 
@@ -329,6 +330,10 @@ class MLForecaster:
             model is an auto-regressive model with lags. If not passed then the data used during the \
             model train is used, defaults to None
         :type data_last_window: Optional[pd.DataFrame], optional
+        :param steps: Number of future steps to forecast. Overrides the default derived from \
+            ``num_lags`` (or ``lags_opt`` when tuned). Use this to request a forecast horizon \
+            longer than the training lag window. If None, the lag count is used, defaults to None
+        :type steps: Optional[int], optional
         :return: A pandas series containing the generated forecasts.
         :rtype: pd.Series
         """
@@ -346,20 +351,24 @@ class MLForecaster:
                 data_last_window = await self.interpolate_async(data_last_window)
 
                 if self.is_tuned:
-                    exog = await self.generate_exog(data_last_window, self.lags_opt, self.var_model)
-
+                    effective_steps = steps if steps is not None else self.lags_opt
+                    exog = await self.generate_exog(
+                        data_last_window, effective_steps, self.var_model
+                    )
                     predictions = await asyncio.to_thread(
                         self.forecaster.predict,
-                        steps=self.lags_opt,
+                        steps=effective_steps,
                         last_window=data_last_window[self.var_model],
                         exog=exog.drop(self.var_model, axis=1),
                     )
                 else:
-                    exog = await self.generate_exog(data_last_window, self.num_lags, self.var_model)
-
+                    effective_steps = steps if steps is not None else self.num_lags
+                    exog = await self.generate_exog(
+                        data_last_window, effective_steps, self.var_model
+                    )
                     predictions = await asyncio.to_thread(
                         self.forecaster.predict,
-                        steps=self.num_lags,
+                        steps=effective_steps,
                         last_window=data_last_window[self.var_model],
                         exog=exog.drop(self.var_model, axis=1),
                     )
