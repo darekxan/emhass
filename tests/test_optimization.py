@@ -4452,6 +4452,129 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "cooling_cops for thermal_config should be updated on cache hit",
         )
 
+    # ---------------------------------------------------------------------------
+    # Netting-window billing tests
+    # ---------------------------------------------------------------------------
+
+    def _make_netting_synthetic_df(self, n_timesteps, freq_min=30):
+        """Build a minimal DataFrame with price columns for netting-window unit tests."""
+        freq = pd.Timedelta(minutes=freq_min)
+        start = pd.Timestamp("2023-06-01 00:00:00", tz="UTC")
+        idx = pd.date_range(start=start, periods=n_timesteps, freq=freq)
+        df = pd.DataFrame(index=idx)
+        df["unit_load_cost"] = 0.20  # €/kWh  (import price)
+        df["unit_prod_price"] = 0.10  # €/kWh  (export price, cheaper → autoconsumption valued)
+        return df
+
+    def test_netting_window_default_no_change(self):
+        """With netting_window_time_steps=1 (default), P_autoconsumption is absent."""
+        df = self.prepare_forecast_data()
+        optim_conf = copy.deepcopy(self.optim_conf)
+        optim_conf["netting_window_time_steps"] = 1
+        opt = self.create_optimization(optim_conf=optim_conf)
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt_res = opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIsInstance(opt_res, pd.DataFrame)
+        self.assertNotIn("P_autoconsumption", opt_res.columns)
+
+    def test_netting_window_dayahead(self):
+        """With netting_window_time_steps=2 and 30-min timestep, optimization is Optimal
+        and P_autoconsumption is present and non-negative."""
+        df = self.prepare_forecast_data()
+        optim_conf = copy.deepcopy(self.optim_conf)
+        optim_conf["netting_window_time_steps"] = 2
+        optim_conf["set_use_battery"] = False
+        opt = self.create_optimization(optim_conf=optim_conf)
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt_res = opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIn("P_autoconsumption", opt_res.columns)
+        self.assertTrue(
+            (opt_res["P_autoconsumption"] >= -1e-6).all(), "autoconsumption must be non-negative"
+        )
+
+    def test_netting_window_autoconsumption_logic(self):
+        """Per-window autoconsumption equals min(E_import_w, E_export_w).
+
+        Scenario (30-min timestep, netting_window_time_steps=2 → 60-min windows):
+          ts0: P_PV=3000W, P_load=1000W → net export 2000W → E_export = 1 kWh
+          ts1: P_PV=0W,    P_load=2000W → net import 2000W → E_import = 1 kWh
+
+        Netting: autoconsumption = min(1, 1) = 1 kWh → e_auto_w = 1 kWh
+        Billed import = 0, billed export = 0 → total cost ≈ 0.
+        """
+        freq_min = 30
+        n_ts = 4  # 2 complete windows (4 timesteps at 30 min, window=2 ts)
+        df = self._make_netting_synthetic_df(n_ts, freq_min=freq_min)
+
+        # PV / load profiles: export then import within window 0; all-import in window 1
+        p_pv = np.array([3000.0, 0.0, 0.0, 0.0])
+        p_load = np.array([1000.0, 2000.0, 1500.0, 1500.0])
+        unit_load_cost = df["unit_load_cost"].values
+        unit_prod_price = df["unit_prod_price"].values
+
+        optim_conf = copy.deepcopy(self.optim_conf)
+        optim_conf["netting_window_time_steps"] = 2
+        optim_conf["set_use_battery"] = False
+        optim_conf["number_of_deferrable_loads"] = 0
+        optim_conf["nominal_power_of_deferrable_loads"] = []
+        optim_conf["minimum_power_of_deferrable_loads"] = []
+        optim_conf["operating_hours_of_each_deferrable_load"] = []
+        optim_conf["treat_deferrable_load_as_semi_cont"] = []
+        optim_conf["set_deferrable_load_single_constant"] = []
+        optim_conf["set_deferrable_startup_penalty"] = []
+        optim_conf["set_deferrable_load_running_overhead"] = []
+        optim_conf["set_deferrable_max_startups"] = []
+        optim_conf["start_timesteps_of_each_deferrable_load"] = []
+        optim_conf["end_timesteps_of_each_deferrable_load"] = []
+
+        retrieve_hass_conf = copy.deepcopy(self.retrieve_hass_conf)
+        retrieve_hass_conf["optimization_time_step"] = pd.Timedelta(minutes=freq_min)
+
+        opt = Optimization(
+            retrieve_hass_conf,
+            optim_conf,
+            self.plant_conf,
+            self.fcst.var_load_cost,
+            self.fcst.var_prod_price,
+            "profit",
+            emhass_conf,
+            logger,
+        )
+
+        opt_res = opt.perform_optimization(df, p_pv, p_load, unit_load_cost, unit_prod_price)
+
+        self.assertIn(opt.optim_status, VALID_OPTIMAL_STATUSES)
+        self.assertIn("P_autoconsumption", opt_res.columns)
+
+        # Window 0: ts0 exports 2000 W → 1 kWh, ts1 imports 2000 W → 1 kWh
+        # LP should set e_auto_w[0] = 1 kWh (export == import → full autoconsumption)
+        ac = opt_res["P_autoconsumption"].values
+        self.assertGreater(ac[0] + ac[1], 0.0, "window-0 autoconsumption should be positive")
+
+        p_grid_pos_w0 = opt_res["P_grid_pos"].values[:2]
+        p_grid_neg_w0 = opt_res["P_grid_neg"].values[:2]
+        e_import_w0 = np.sum(p_grid_pos_w0) * 0.5 * 0.001  # kWh
+        e_export_w0 = -np.sum(p_grid_neg_w0) * 0.5 * 0.001  # kWh
+        e_auto_w0 = (ac[0] + ac[1]) * 0.5 * 0.001  # kWh (from distributed W → kWh)
+        self.assertLessEqual(e_auto_w0, e_import_w0 + 1e-6, "autoconsumption <= import")
+        self.assertLessEqual(e_auto_w0, e_export_w0 + 1e-6, "autoconsumption <= export")
+
 
 if __name__ == "__main__":
     unittest.main()

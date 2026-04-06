@@ -975,6 +975,18 @@ class Optimization:
         else:
             vars_dict["p_def_sum"] = np.zeros(n)
 
+        # Netting-window billing: group ntw consecutive timesteps into one billing window
+        # and net import vs export within it before applying prices.
+        # ntw=1 (default) → per-timestep billing, unchanged behaviour.
+        # ntw=2 with 30-min timestep → 60-min windows (e.g. hourly netting per OZE / Poland).
+        ntw = int(self.optim_conf.get("netting_window_time_steps", 1))
+        if ntw > 1:
+            n_windows = n // ntw  # complete windows only; tail timesteps use per-timestep billing
+            if n_windows > 0:
+                vars_dict["e_auto_w"] = cp.Variable(n_windows, nonneg=True, name="e_auto_w")
+                vars_dict["_ntw_spw"] = ntw
+                vars_dict["_ntw_n_windows"] = n_windows
+
         return vars_dict, constraints
 
     def _build_objective_function(
@@ -1009,7 +1021,40 @@ class Optimization:
         objective_terms = []
 
         # Base Cost Function
-        if self.costfun == "profit":
+        netting_active = "e_auto_w" in self.vars
+
+        if netting_active:
+            # Netting-window billing: only the net import/export after deducting
+            # per-window autoconsumption is charged. The autoconsumption portion is free.
+            #
+            # cost_w = (E_import_w - e_auto_w) * price_load_w
+            #         - (E_export_w - e_auto_w) * price_prod_w
+            #
+            # The LP drives e_auto_w → min(E_import_w, E_export_w) because increasing
+            # autoconsumption reduces cost whenever unit_load_cost >= unit_prod_price.
+            e_auto_w = self.vars["e_auto_w"]
+            spw = self.vars["_ntw_spw"]
+            n_windows = self.vars["_ntw_n_windows"]
+            netting_terms = []
+            for w in range(n_windows):
+                sl = slice(w * spw, (w + 1) * spw)
+                # Mean price for this window (CVXPY affine expression)
+                price_load_w = cp.sum(unit_load_cost[sl]) / spw
+                price_prod_w = cp.sum(unit_prod_price[sl]) / spw
+                e_import_w = scale * cp.sum(p_grid_pos[sl])
+                e_export_w = -scale * cp.sum(p_grid_neg[sl])
+                net_import_w = e_import_w - e_auto_w[w]
+                net_export_w = e_export_w - e_auto_w[w]
+                netting_terms.append(price_load_w * net_import_w - price_prod_w * net_export_w)
+            # Any tail timesteps beyond complete windows fall back to per-timestep billing
+            tail_start = n_windows * spw
+            if tail_start < self.num_timesteps:
+                tail_cost = cp.multiply(unit_load_cost[tail_start:], p_grid_pos[tail_start:])
+                tail_prod = cp.multiply(unit_prod_price[tail_start:], p_grid_neg[tail_start:])
+                netting_terms.append(scale * cp.sum(tail_cost + tail_prod))
+            objective_terms.append(-cp.sum(netting_terms))
+
+        elif self.costfun == "profit":
             # Profit = Export Income - Import Cost
             # formulated as: -Cost - (Export_Neg_Value * Price)
             # Since p_grid_neg is negative, (Export_Neg * Price) is negative (cost-like).
@@ -1162,6 +1207,39 @@ class Optimization:
 
         # -p_grid_neg <= max_to_grid[t] * (1 - D[t])
         constraints.append(-p_grid_neg <= cp.multiply(max_power_to_grid_arr, (1 - D)))
+
+    def _add_netting_window_constraints(self, constraints):
+        """Add netting-window billing constraints.
+
+        For each complete billing window in the optimization horizon, bounds the
+        per-window autoconsumption variable ``e_auto_w[w]`` (kWh) by both the
+        total energy imported and the total energy exported during that window:
+
+            e_auto_w[w] <= scale * sum(p_grid_pos[w*spw : (w+1)*spw])
+            e_auto_w[w] <= scale * (-sum(p_grid_neg[w*spw : (w+1)*spw]))
+
+        The LP objective will then drive ``e_auto_w[w]`` to
+        ``min(E_import_w, E_export_w)`` since increasing autoconsumption reduces
+        net billing cost (given ``unit_load_cost >= unit_prod_price``).
+
+        Only active when ``netting_window_time_steps > 1``.
+        """
+        if "e_auto_w" not in self.vars:
+            return
+
+        e_auto_w = self.vars["e_auto_w"]
+        spw = self.vars["_ntw_spw"]
+        n_windows = self.vars["_ntw_n_windows"]
+        p_grid_pos = self.vars["p_grid_pos"]
+        p_grid_neg = self.vars["p_grid_neg"]
+        scale = 0.001 * self.time_step  # W → kWh per timestep
+
+        for w in range(n_windows):
+            sl = slice(w * spw, (w + 1) * spw)
+            e_import_w = scale * cp.sum(p_grid_pos[sl])
+            e_export_w = -scale * cp.sum(p_grid_neg[sl])
+            constraints.append(e_auto_w[w] <= e_import_w)
+            constraints.append(e_auto_w[w] <= e_export_w)
 
     def _add_hybrid_inverter_constraints(self, constraints, inv_stress_conf):
         """Add constraints specific to hybrid inverters (Vectorized)."""
@@ -2812,6 +2890,20 @@ class Optimization:
 
         opt_tp["cost_profit"] = cost_profit
 
+        # Netting-window autoconsumption results
+        if "e_auto_w" in self.vars:
+            e_auto_w_val = self.vars["e_auto_w"].value
+            spw = self.vars["_ntw_spw"]
+            n_windows = self.vars["_ntw_n_windows"]
+            # Expand per-window autoconsumption (kWh/window) back to per-timestep power (W)
+            e_auto_per_ts = np.zeros(self.num_timesteps)
+            if e_auto_w_val is not None:
+                for w in range(n_windows):
+                    sl = slice(w * spw, (w + 1) * spw)
+                    # Distribute autoconsumption evenly across the window's timesteps
+                    e_auto_per_ts[sl] = (e_auto_w_val[w] / spw) / (0.001 * self.time_step)
+            opt_tp["P_autoconsumption"] = e_auto_per_ts
+
         # Specific Cost Function Breakdown
         if self.costfun == "profit":
             opt_tp["cost_fun_profit"] = cost_profit
@@ -3193,6 +3285,7 @@ class Optimization:
 
             # Add Constraints
             self._add_main_power_balance_constraints(constraints)
+            self._add_netting_window_constraints(constraints)
             self._add_hybrid_inverter_constraints(constraints, inv_stress_conf)
             self._add_battery_constraints(constraints, batt_stress_conf)
 
@@ -3337,6 +3430,7 @@ class Optimization:
 
             # Re-apply main constraints
             self._add_main_power_balance_constraints(constraints_relaxed)
+            self._add_netting_window_constraints(constraints_relaxed)
             # (Note: We reuse previous stress configs as they don't change with relaxation)
             if inv_stress_conf:
                 self._add_hybrid_inverter_constraints(constraints_relaxed, inv_stress_conf)
