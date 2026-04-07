@@ -565,6 +565,11 @@ class Forecast:
         data_list = self._normalize_passed_forecast_input(
             self.params["passed_data"]["pv_power_forecast"]
         )
+        if data_list is None:
+            self.logger.error(
+                "pv_power_forecast passed data is None; cannot build weather forecast list."
+            )
+            return None
         if (
             len(data_list) < len(self.forecast_dates)
             and self.params["passed_data"]["prediction_horizon"] is None
