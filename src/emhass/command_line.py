@@ -1216,8 +1216,10 @@ async def perfect_forecast_optim(
     )
     if isinstance(df_input_data, bool) and not df_input_data:
         return False
-    opt_res = input_data_dict["opt"].perform_perfect_forecast_optim(
-        df_input_data, input_data_dict["days_list"]
+    opt_res = await asyncio.to_thread(
+        input_data_dict["opt"].perform_perfect_forecast_optim,
+        df_input_data,
+        input_data_dict["days_list"],
     )
     # Save CSV file for analysis
     if save_data_to_file:
@@ -1425,7 +1427,8 @@ async def dayahead_forecast_optim(
     )
     if isinstance(df_input_data_dayahead, bool) and not df_input_data_dayahead:
         return False
-    opt_res_dayahead = input_data_dict["opt"].perform_dayahead_forecast_optim(
+    opt_res_dayahead = await asyncio.to_thread(
+        input_data_dict["opt"].perform_dayahead_forecast_optim,
         df_input_data_dayahead,
         input_data_dict["p_pv_forecast"],
         input_data_dict["p_load_forecast"],
@@ -1502,7 +1505,8 @@ async def naive_mpc_optim(
     def_end_timestep = input_data_dict["params"]["optim_conf"][
         "end_timesteps_of_each_deferrable_load"
     ]
-    opt_res_naive_mpc = input_data_dict["opt"].perform_naive_mpc_optim(
+    opt_res_naive_mpc = await asyncio.to_thread(
+        input_data_dict["opt"].perform_naive_mpc_optim,
         df_input_data_dayahead,
         input_data_dict["p_pv_forecast"],
         input_data_dict["p_load_forecast"],

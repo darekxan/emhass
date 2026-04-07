@@ -987,13 +987,17 @@ class Optimization:
         # and net import vs export within it before applying prices.
         # ntw=1 (default) → per-timestep billing, unchanged behaviour.
         # ntw=2 with 30-min timestep → 60-min windows (e.g. hourly netting per OZE / Poland).
+        # Windows are aligned to wall-clock boundaries (00:00, ntw*step, 2*ntw*step, ...).
+        # Head timesteps that precede the first complete boundary are billed per-timestep.
         ntw = int(self.optim_conf.get("netting_window_time_steps", 1))
         if ntw > 1:
-            n_windows = n // ntw  # complete windows only; tail timesteps use per-timestep billing
+            head = getattr(self, "_ntw_head_offset", 0)
+            n_windows = (n - head) // ntw  # complete windows after head; tail billed per-timestep
             if n_windows > 0:
                 vars_dict["e_auto_w"] = cp.Variable(n_windows, nonneg=True, name="e_auto_w")
                 vars_dict["_ntw_spw"] = ntw
                 vars_dict["_ntw_n_windows"] = n_windows
+                vars_dict["_ntw_head"] = head
 
         return vars_dict, constraints
 
@@ -1040,12 +1044,21 @@ class Optimization:
             #
             # The LP drives e_auto_w → min(E_import_w, E_export_w) because increasing
             # autoconsumption reduces cost whenever unit_load_cost >= unit_prod_price.
+            #
+            # Windows are wall-clock aligned. Head timesteps (before the first complete
+            # boundary) and tail timesteps fall back to per-timestep billing.
             e_auto_w = self.vars["e_auto_w"]
             spw = self.vars["_ntw_spw"]
             n_windows = self.vars["_ntw_n_windows"]
+            head = self.vars.get("_ntw_head", 0)
             netting_terms = []
+            # Head: per-timestep billing for steps before the first wall-clock boundary
+            if head > 0:
+                head_cost = cp.multiply(unit_load_cost[:head], p_grid_pos[:head])
+                head_prod = cp.multiply(unit_prod_price[:head], p_grid_neg[:head])
+                netting_terms.append(scale * cp.sum(head_cost + head_prod))
             for w in range(n_windows):
-                sl = slice(w * spw, (w + 1) * spw)
+                sl = slice(head + w * spw, head + (w + 1) * spw)
                 # Mean price for this window (CVXPY affine expression)
                 price_load_w = cp.sum(unit_load_cost[sl]) / spw
                 price_prod_w = cp.sum(unit_prod_price[sl]) / spw
@@ -1054,8 +1067,8 @@ class Optimization:
                 net_import_w = e_import_w - e_auto_w[w]
                 net_export_w = e_export_w - e_auto_w[w]
                 netting_terms.append(price_load_w * net_import_w - price_prod_w * net_export_w)
-            # Any tail timesteps beyond complete windows fall back to per-timestep billing
-            tail_start = n_windows * spw
+            # Tail: per-timestep billing for steps after the last complete window
+            tail_start = head + n_windows * spw
             if tail_start < self.num_timesteps:
                 tail_cost = cp.multiply(unit_load_cost[tail_start:], p_grid_pos[tail_start:])
                 tail_prod = cp.multiply(unit_prod_price[tail_start:], p_grid_neg[tail_start:])
@@ -1257,8 +1270,9 @@ class Optimization:
         p_grid_neg = self.vars["p_grid_neg"]
         scale = 0.001 * self.time_step  # W → kWh per timestep
 
+        head = self.vars.get("_ntw_head", 0)
         for w in range(n_windows):
-            sl = slice(w * spw, (w + 1) * spw)
+            sl = slice(head + w * spw, head + (w + 1) * spw)
             e_import_w = scale * cp.sum(p_grid_pos[sl])
             e_export_w = -scale * cp.sum(p_grid_neg[sl])
             constraints.append(e_auto_w[w] <= e_import_w)
@@ -3100,6 +3114,24 @@ class Optimization:
             self.vars, self.constraints = self._initialize_decision_variables()
 
             # Force problem rebuild
+            self.prob = None
+
+        # Netting-window wall-clock alignment: compute how many head timesteps fall
+        # before the first complete window boundary anchored at 00:00.
+        ntw_cfg = int(self.optim_conf.get("netting_window_time_steps", 1))
+        if ntw_cfg > 1 and len(data_opt) > 0:
+            step_min = int(self.freq.total_seconds() / 60)
+            window_min = ntw_cfg * step_min
+            t0 = data_opt.index[0]
+            minutes_past_midnight = t0.hour * 60 + t0.minute
+            steps_into_window = (minutes_past_midnight % window_min) // step_min
+            new_head = int((ntw_cfg - steps_into_window) % ntw_cfg)
+        else:
+            new_head = 0
+        old_head = getattr(self, "_ntw_head_offset", -1)
+        if new_head != old_head:
+            self._ntw_head_offset = new_head
+            self.vars, self.constraints = self._initialize_decision_variables()
             self.prob = None
 
         # Data Validation & Defaults
