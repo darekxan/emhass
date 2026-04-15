@@ -2400,7 +2400,12 @@ class Optimization:
                 alpha = 1.0
 
             # Q_input variable: filtered heat energy per timestep (kWh)
-            q_input = cp.Variable(required_len, nonneg=True, name=f"q_input_{k}")
+            # In dual-mode, raw_heat = heating - cooling can be negative (net cooling),
+            # so the filter output must be allowed to go negative too.
+            # Constraining nonneg=True in dual-mode contradicts the equality filter
+            # constraints and makes the LP infeasible whenever cooling is active.
+            _dual_cooling = dual_mode_enabled and p_cool is not None
+            q_input = cp.Variable(required_len, nonneg=not _dual_cooling, name=f"q_input_{k}")
 
             # Raw heat input depends on mode (heating adds, cooling removes)
             if dual_mode_enabled and p_cool is not None and cool_cops_arr is not None:
