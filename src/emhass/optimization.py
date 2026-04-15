@@ -647,13 +647,31 @@ class Optimization:
 
                 # Heatpump COPs (heating + cooling when dual-mode)
                 if dual_mode_enabled:
-                    heat_cops, cool_cops = utils.calculate_cop_dual_mode(
-                        heat_supply_temperature=supply_temperature,
-                        cool_supply_temperature=cool_supply_temperature,
-                        heat_carnot_efficiency=heat_efficiency,
-                        cool_carnot_efficiency=cool_efficiency,
-                        outdoor_temperature_forecast=outdoor_temp.tolist(),
-                    )
+                    # If fixed COP values are provided in config (e.g. GSHP manufacturer specs),
+                    # use them directly and skip the Carnot / outdoor-air formula.
+                    fixed_heat_cops = hc.get("heating_cops")
+                    fixed_cool_cops = hc.get("cooling_cops")
+                    if fixed_heat_cops is not None and fixed_cool_cops is not None:
+                        h_val = float(
+                            fixed_heat_cops[0]
+                            if isinstance(fixed_heat_cops, list)
+                            else fixed_heat_cops
+                        )
+                        c_val = float(
+                            fixed_cool_cops[0]
+                            if isinstance(fixed_cool_cops, list)
+                            else fixed_cool_cops
+                        )
+                        heat_cops = np.full(n, h_val)
+                        cool_cops = np.full(n, c_val)
+                    else:
+                        heat_cops, cool_cops = utils.calculate_cop_dual_mode(
+                            heat_supply_temperature=supply_temperature,
+                            cool_supply_temperature=cool_supply_temperature,
+                            heat_carnot_efficiency=heat_efficiency,
+                            cool_carnot_efficiency=cool_efficiency,
+                            outdoor_temperature_forecast=outdoor_temp.tolist(),
+                        )
                     params["heatpump_cops"].value = np.array(heat_cops[:n])
                     if "cooling_cops" in params:
                         params["cooling_cops"].value = np.array(cool_cops[:n])
@@ -1990,14 +2008,28 @@ class Optimization:
 
             # Compute and set derived parameter values
             if dual_mode_enabled:
-                # Dual-mode: calculate separate heating and cooling COPs
-                heat_cops, cool_cops = utils.calculate_cop_dual_mode(
-                    heat_supply_temperature=heat_supply_temp,
-                    cool_supply_temperature=cool_supply_temp,
-                    heat_carnot_efficiency=heat_efficiency,
-                    cool_carnot_efficiency=cool_efficiency,
-                    outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
-                )
+                # Dual-mode: calculate separate heating and cooling COPs.
+                # If fixed COP values are provided in config (e.g. GSHP manufacturer specs),
+                # use them directly and skip the Carnot / outdoor-air formula.
+                fixed_heat_cops = hc.get("heating_cops")
+                fixed_cool_cops = hc.get("cooling_cops")
+                if fixed_heat_cops is not None and fixed_cool_cops is not None:
+                    h_val = float(
+                        fixed_heat_cops[0] if isinstance(fixed_heat_cops, list) else fixed_heat_cops
+                    )
+                    c_val = float(
+                        fixed_cool_cops[0] if isinstance(fixed_cool_cops, list) else fixed_cool_cops
+                    )
+                    heat_cops = np.full(required_len, h_val)
+                    cool_cops = np.full(required_len, c_val)
+                else:
+                    heat_cops, cool_cops = utils.calculate_cop_dual_mode(
+                        heat_supply_temperature=heat_supply_temp,
+                        cool_supply_temperature=cool_supply_temp,
+                        heat_carnot_efficiency=heat_efficiency,
+                        cool_carnot_efficiency=cool_efficiency,
+                        outdoor_temperature_forecast=outdoor_temp_arr.tolist(),
+                    )
                 # Store heating COP in main parameter for compatibility
                 params["heatpump_cops"].value = np.array(heat_cops[:required_len])
                 # Store cooling COP separately
