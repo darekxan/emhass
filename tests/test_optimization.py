@@ -4452,6 +4452,82 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "cooling_cops for thermal_config should be updated on cache hit",
         )
 
+    def test_thermal_config_dual_mode_no_min_runtime_allows_short_runs(self):
+        """Without min_runtime the optimizer is free to switch the heat pump on for
+        a single timestep — confirming the constraint is what enforces longer runs.
+
+        Parameter choice rationale:
+        - heating_rate=1.5 → ΔT_on ≈ 2.3°C/step (COP≈3.1 × 1.5 × 0.5h / 3000W × 3000W)
+        - natural cooling ≈ 1.25°C/step at T=20°C, outdoor=-5°C
+        - one pump step brings T from ~16°C to ~18°C; two off-steps then drop it back
+          to ~16°C → stable 1-on/1-off alternation with single-step heat_active pulses
+        - the default helper heating_rate=10.0 gives ΔT_on≈15°C which always overshoots
+          the [16,28] band, making the MILP infeasible and forcing a relaxed-LP fallback
+          that runs at fractional continuous power (no discrete pulses)
+        """
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-5.0)
+        # Scale down heating power so one binary pump step stays within [16, 28]
+        config["heating_rate"] = 1.5
+        # No min_runtime key → defaults to 1 (no constraint)
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        # Uniform pricing: remove peak/off-peak incentive to pre-heat to max_temp.
+        # With peak pricing the LP runs long blocks during cheap periods (optimising
+        # cost, not cycling), so no single-step pulse would appear.  Uniform pricing
+        # forces the LP to minimise total on-time which naturally produces short pulses.
+        df["unit_load_cost"] = 0.20
+        df["unit_prod_price"] = 0.10
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        heat = opt_res["heat_active0"].values.round().astype(int)
+        # Find any single-timestep run: 0→1→0
+        has_short_run = any(
+            heat[t] == 1
+            and (t == 0 or heat[t - 1] == 0)
+            and (t == len(heat) - 1 or heat[t + 1] == 0)
+            for t in range(len(heat))
+        )
+        self.assertTrue(
+            has_short_run,
+            "Expected at least one single-timestep heat_active run without min_runtime, "
+            "but none found — the test scenario may need adjustment.",
+        )
+
+    def test_thermal_config_dual_mode_min_runtime(self):
+        """min_runtime must prevent the heat pump from switching off before staying on
+        for the specified number of consecutive timesteps.
+
+        Uses heating_rate=1.5 (same as the no-min_runtime companion test) so the MILP
+        is feasible with binary on/off control — see that test's docstring for details.
+        """
+        min_rt = 4
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-5.0)
+        config["min_runtime"] = min_rt
+        config["heating_rate"] = 1.5
+        # Widen the temperature band so the optimizer has room to switch off mid-horizon
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        heat = opt_res["heat_active0"].values.round().astype(int)
+        # Check every rising edge: once heat_active goes 0→1, the next (min_rt-1)
+        # timesteps must all be 1 (or we must be at the end of the horizon).
+        violations = 0
+        for t in range(1, len(heat)):
+            if heat[t] == 1 and heat[t - 1] == 0:
+                for i in range(1, min_rt):
+                    if t + i < len(heat) and heat[t + i] == 0:
+                        violations += 1
+                        break
+        self.assertEqual(
+            violations,
+            0,
+            f"min_runtime={min_rt} violated: heat pump switched off before staying on "
+            f"for {min_rt} consecutive timesteps",
+        )
+
     # ---------------------------------------------------------------------------
     # Netting-window billing tests
     # ---------------------------------------------------------------------------
