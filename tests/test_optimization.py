@@ -4243,6 +4243,167 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "cooling_cops should be updated on cache hit (update_thermal_params)",
         )
 
+    def test_thermal_battery_dual_mode_fixed_cop_bypasses_carnot(self):
+        """Fixed heating_cops/cooling_cops must be used instead of the Carnot formula.
+
+        Regression test for the GSHP scenario: outdoor temps are all 12 °C, below the
+        cool_supply_temperature of 18 °C.  Without the fix, calculate_cop_dual_mode
+        would set cooling COP=1.0 for every timestep.  With COP=1.0 the 2.1 kW pump
+        delivers only 2.1 kW of cooling against ~14 kW of solar gain → infeasible.
+
+        With the fix the config-supplied cooling_cops=5.0 is used, delivering
+        ~10 kW of cooling which can match the solar gain → feasible.
+        """
+        horizon = len(self.df_input_data_dayahead)
+        # All outdoor temps below cool_supply_temperature → Carnot formula gives COP=1.0
+        outdoor_temps = [12.0] * horizon
+        # Strong solar irradiance throughout to force the LP to use cooling
+        ghi = [800.0] * horizon
+
+        config = {
+            "start_temperature": 22.0,
+            "supply_temperature": 35.0,
+            "volume": 200.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [18.0] * horizon,
+            "max_temperatures": [26.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 60.0,
+            "shgc": 0.7,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 18.0,  # outdoor (12 °C) is below this threshold
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            # Fixed GSHP manufacturer COPs — must override the Carnot formula
+            "heating_cops": [4.4],
+            "cooling_cops": [5.0],
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = outdoor_temps
+        df["ghi"] = ghi
+
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt_res = opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        # 1. Optimization must not be infeasible (result is a non-empty DataFrame)
+        self.assertIsInstance(opt_res, pd.DataFrame)
+        self.assertGreater(
+            len(opt_res), 0, "Optimization returned empty result — likely infeasible"
+        )
+        self.assertFalse(
+            opt_res["P_deferrable0"].isna().all(),
+            "P_deferrable0 is all-NaN — optimization was infeasible with fixed COPs",
+        )
+
+        # 2. Cooling must have been active at some point (solar gains drove temp up)
+        self.assertIn("cool_active0", opt_res.columns)
+        self.assertGreater(
+            opt_res["cool_active0"].sum(),
+            0,
+            "cool_active0 never non-zero — fixed COPs did not enable cooling",
+        )
+
+        # 3. The installed cooling_cops parameter must equal the fixed value (5.0), not 1.0
+        np.testing.assert_allclose(
+            opt.param_thermal[0]["cooling_cops"].value,
+            np.full(horizon, 5.0),
+            rtol=1e-6,
+            err_msg="cooling_cops parameter is not 5.0 — fixed-COP override was not applied",
+        )
+
+    def test_thermal_battery_dual_mode_fixed_cop_preserved_on_cache_hit(self):
+        """Fixed COPs must survive a cache hit (update_thermal_params must not overwrite them).
+
+        On a second MPC call the CVXPY problem is reused (cache hit) and
+        update_thermal_params is called instead of a full rebuild.  The fixed
+        heating_cops/cooling_cops values must stay at the configured constants
+        regardless of the new outdoor temperature forecast.
+        """
+        horizon = len(self.df_input_data_dayahead)
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [18.0] * horizon,
+            "max_temperatures": [26.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 18.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "heating_cops": [4.4],
+            "cooling_cops": [5.0],
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        # First solve
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = 12.0
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        cops_after_first = opt.param_thermal[0]["cooling_cops"].value.copy()
+        np.testing.assert_allclose(
+            cops_after_first,
+            np.full(horizon, 5.0),
+            rtol=1e-6,
+            err_msg="cooling_cops not 5.0 after first solve",
+        )
+
+        # Simulate a cache-hit update with a very different outdoor temperature (35 °C).
+        # Without the fix, update_thermal_params would recalculate COPs from 35 °C
+        # via calculate_cop_dual_mode and overwrite the fixed value.
+        hot_df = df.copy()
+        hot_df["outdoor_temperature_forecast"] = 35.0
+        opt.update_thermal_params(
+            self.optim_conf,
+            hot_df,
+            self.p_load_forecast.values.ravel(),
+        )
+
+        cops_after_update = opt.param_thermal[0]["cooling_cops"].value
+        np.testing.assert_allclose(
+            cops_after_update,
+            np.full(horizon, 5.0),
+            rtol=1e-6,
+            err_msg=(
+                "cooling_cops changed after update_thermal_params cache hit — "
+                "fixed COPs were overwritten by the Carnot formula"
+            ),
+        )
+
     def test_thermal_battery_dual_mode_result_columns(self):
         """Verify dual-mode result columns heat_active and cool_active are present."""
         self.df_input_data_dayahead = self.prepare_forecast_data()
