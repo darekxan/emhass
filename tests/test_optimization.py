@@ -4512,6 +4512,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # When it's very cold, cooling activity should be zero or near-zero
         cool_total = opt_res["cool_active0"].sum()
         heat_total = opt_res["heat_active0"].sum()
+        self.assertGreater(heat_total, 0, "Expected heating to be scheduled at -10°C")
         self.assertGreater(
             heat_total,
             cool_total,
@@ -4529,6 +4530,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
         cool_total = opt_res["cool_active0"].sum()
         heat_total = opt_res["heat_active0"].sum()
+        self.assertGreater(cool_total, 0, "Expected cooling to be scheduled at 40°C")
         self.assertGreaterEqual(
             cool_total,
             heat_total,
