@@ -1699,6 +1699,11 @@ class Optimization:
 
             # Minimum runtime (prevent rapid cycling)
             if min_runtime > 1:
+                # t=0 boundary: use previous on/off state from param_def_current_state
+                prev = self.param_def_current_state[k]
+                for i in range(1, min(min_runtime, required_len)):
+                    constraints.append(heat_active[0] - prev <= heat_active[i])
+                    constraints.append(cool_active[0] - prev <= cool_active[i])
                 for t in range(1, required_len):
                     for i in range(1, min(min_runtime, required_len - t)):
                         constraints.append(
@@ -1708,18 +1713,13 @@ class Optimization:
                             cool_active[t] - cool_active[t - 1] <= cool_active[t + i]
                         )
 
-            # Transition cooldown
+            # Transition cooldown: per-step constraints (not a SUM) so that multiple
+            # consecutive steps in one mode don't make the constraint infeasible.
             if transition_cooldown > 0:
-                for t in range(transition_cooldown, required_len):
-                    cooling_in_cooldown = sum(
-                        cool_active[t - i] for i in range(1, min(transition_cooldown + 1, t + 1))
-                    )
-                    constraints.append(heat_active[t] + cooling_in_cooldown <= 1)
-
-                    heating_in_cooldown = sum(
-                        heat_active[t - i] for i in range(1, min(transition_cooldown + 1, t + 1))
-                    )
-                    constraints.append(cool_active[t] + heating_in_cooldown <= 1)
+                for t in range(1, required_len):
+                    for i in range(1, min(transition_cooldown + 1, t + 1)):
+                        constraints.append(heat_active[t] + cool_active[t - i] <= 1)
+                        constraints.append(cool_active[t] + heat_active[t - i] <= 1)
 
             # Fetch COP arrays from parameters (RC dynamics only need COPs, not demand arrays)
             if k in self.param_thermal:
@@ -2267,6 +2267,11 @@ class Optimization:
 
             # Minimum runtime constraints (prevent rapid cycling)
             if min_runtime > 1:
+                # t=0 boundary: use previous on/off state from param_def_current_state
+                prev = self.param_def_current_state[k]
+                for i in range(1, min(min_runtime, required_len)):
+                    constraints.append(heat_active[0] - prev <= heat_active[i])
+                    constraints.append(cool_active[0] - prev <= cool_active[i])
                 for t in range(1, required_len):
                     # When mode transitions from off to on, must stay on for min_runtime
                     for i in range(1, min(min_runtime, required_len - t)):
@@ -2277,20 +2282,14 @@ class Optimization:
                             cool_active[t] - cool_active[t - 1] <= cool_active[t + i]
                         )
 
-            # Transition cooldown: prevent immediate switching between modes
+            # Transition cooldown: prevent immediate switching between modes.
+            # Use per-step constraints (not a SUM) so that multiple consecutive steps
+            # in one mode don't make the constraint infeasible for the other mode.
             if transition_cooldown > 0:
-                for t in range(transition_cooldown, required_len):
-                    # Can't activate heating if cooling was active in cooldown period
-                    cooling_in_cooldown = sum(
-                        cool_active[t - i] for i in range(1, min(transition_cooldown + 1, t + 1))
-                    )
-                    constraints.append(heat_active[t] + cooling_in_cooldown <= 1)
-
-                    # Can't activate cooling if heating was active in cooldown period
-                    heating_in_cooldown = sum(
-                        heat_active[t - i] for i in range(1, min(transition_cooldown + 1, t + 1))
-                    )
-                    constraints.append(cool_active[t] + heating_in_cooldown <= 1)
+                for t in range(1, required_len):
+                    for i in range(1, min(transition_cooldown + 1, t + 1)):
+                        constraints.append(heat_active[t] + cool_active[t - i] <= 1)
+                        constraints.append(cool_active[t] + heat_active[t - i] <= 1)
 
             # Get COPs and demands
             if k in self.param_thermal:

@@ -4691,6 +4691,77 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             f"for {min_rt} consecutive timesteps",
         )
 
+    def test_thermal_config_dual_mode_min_runtime_t0_boundary(self):
+        """min_runtime must also apply when the HP starts at t=0 (was OFF previously).
+
+        Regression test for the bug where the loop started at t=1, allowing the
+        optimizer to run the HP for a single timestep at t=0 with no constraint.
+        """
+        min_rt = 4
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-10.0)
+        config["min_runtime"] = min_rt
+        config["heating_rate"] = 1.5
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+        # Start with HP OFF so t=0 is a potential start-up timestep
+        self.optim_conf["def_current_state"] = [False]
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        heat = opt_res["heat_active0"].values.round().astype(int)
+        cool = (
+            opt_res.get("cool_active0", pd.Series(0, index=opt_res.index))
+            .values.round()
+            .astype(int)
+        )
+
+        # Check t=0 boundary: if HP starts at t=0 it must stay on for min_rt steps
+        for mode_arr in (heat, cool):
+            if mode_arr[0] == 1:
+                for i in range(1, min(min_rt, len(mode_arr))):
+                    self.assertEqual(
+                        mode_arr[i],
+                        1,
+                        f"min_runtime={min_rt} violated at t=0: mode switched off at t={i}",
+                    )
+
+    def test_thermal_battery_dual_mode_transition_cooldown_feasible_after_multi_step_cool(self):
+        """transition_cooldown must remain feasible when cooling runs for multiple
+        consecutive steps (>1).
+
+        Regression test for the SUM-based constraint bug: summing binary variables over
+        the cooldown window produced a coefficient > 1 (e.g. SUM=8 for 8 cooling steps),
+        making  heat_active[t] + 8 <= 1  impossible for a binary variable.
+        """
+        n = 48  # match the default prepare_forecast_data() horizon
+        outdoor = [35.0] * n  # always hot → forces cooling
+        ghi = [1000.0] * n
+
+        config = {
+            "volume": 10.0,
+            "start_temperature": 24.0,
+            "min_temperatures": [20.0] * n,
+            "max_temperatures": [26.0] * n,
+            "u_value": 0.3,
+            "envelope_area": 200.0,
+            "ventilation_rate": 0.3,
+            "heated_volume": 300.0,
+            "indoor_target_temperature": 22.0,
+            "supply_temperature": 35.0,
+            "carnot_efficiency": 0.4,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_supply_temperature": 12.0,
+            "cool_carnot_efficiency": 0.45,
+            "min_runtime": 4,
+            "transition_cooldown": 6,
+            "window_area": 20.0,
+            "shgc": 0.3,
+        }
+        opt_res = self.run_thermal_battery_optimization(config, outdoor_temps=outdoor, ghi=ghi)
+        self.assertIsNotNone(opt_res, "Optimization must not return None (feasibility failure)")
+
     # ---------------------------------------------------------------------------
     # Netting-window billing tests
     # ---------------------------------------------------------------------------
