@@ -1694,6 +1694,18 @@ class Optimization:
             constraints.append(p_heat <= heat_active * nominal_power)
             constraints.append(p_cool <= cool_active * nominal_power)
 
+            # Lower bound: when a mode is active power must meet minimum_power.
+            # Without this the min_runtime binary can stay 1 while actual power
+            # drops to 0, satisfying min_runtime on paper while clocking the load.
+            min_power_val = (
+                float(self.param_min_power[k].value)
+                if self.param_min_power[k].value is not None
+                else 0.0
+            )
+            if min_power_val > 0:
+                constraints.append(p_heat >= self.param_min_power[k] * heat_active)
+                constraints.append(p_cool >= self.param_min_power[k] * cool_active)
+
             # Mutual exclusivity
             constraints.append(heat_active + cool_active <= 1)
 
@@ -2261,6 +2273,19 @@ class Optimization:
             # Semi-continuous constraints: power only flows when mode is active
             constraints.append(p_heat <= heat_active * nominal_power)
             constraints.append(p_cool <= cool_active * nominal_power)
+
+            # Lower bound: when a mode is active power must meet minimum_power.
+            # Without this the min_runtime binary can stay 1 while actual power
+            # drops to 0, letting the optimizer satisfy min_runtime on paper while
+            # actually clocking the load in just 1-2 steps.
+            min_power_val = (
+                float(self.param_min_power[k].value)
+                if self.param_min_power[k].value is not None
+                else 0.0
+            )
+            if min_power_val > 0:
+                constraints.append(p_heat >= self.param_min_power[k] * heat_active)
+                constraints.append(p_cool >= self.param_min_power[k] * cool_active)
 
             # Mutual exclusivity: can't heat and cool simultaneously
             constraints.append(heat_active + cool_active <= 1)
