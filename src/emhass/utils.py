@@ -1906,6 +1906,11 @@ async def treat_runtimeparams(
                 bool(s) for s in runtimeparams["def_current_state"]
             ]
 
+        if "def_load_steps_fulfilled" in runtimeparams:
+            params["optim_conf"]["def_load_steps_fulfilled"] = [
+                int(s) for s in runtimeparams["def_load_steps_fulfilled"]
+            ]
+
         # Treat retrieve data from Home Assistant (retrieve_hass_conf) configuration parameters passed at runtime
         # Secrets passed at runtime
         if "solcast_api_key" in runtimeparams.keys():
