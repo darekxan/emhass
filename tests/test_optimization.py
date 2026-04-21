@@ -4804,14 +4804,54 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_def_load_steps_fulfilled_zero_means_no_obligation(self):
-        """def_load_steps_fulfilled=[0] must behave identically to not passing the
-        parameter: no forced-on steps, optimization solves freely.
-        """
-        opt_res, _opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[0], min_runtime=4)
+        """def_load_steps_fulfilled=[0] must produce a zero obligation mask: the
+        load is not mid-run, so no timestep can be forced on.
 
-        self.assertIsInstance(opt_res, type(pd.DataFrame()))
-        self.assertIn("P_deferrable0", opt_res.columns)
-        self.assertGreater(len(opt_res), 0)
+        Regression: before the def_current_state gate, remaining was computed as
+        min_runtime - 0 = min_runtime, forcing the load on for the first
+        min_runtime steps of every fresh horizon.
+        """
+        self.optim_conf["def_current_state"] = [False]
+        _opt_res, opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[0], min_runtime=4)
+
+        mask = opt.param_obligation_masks[0].value
+        self.assertIsNotNone(mask, "param_obligation_masks[0].value must not be None")
+        self.assertTrue(
+            np.all(mask == 0.0),
+            f"obligation mask must be all zeros when load is not mid-run, got {mask[:8]}",
+        )
+
+    def test_obligation_mask_zero_when_steps_fulfilled_missing(self):
+        """When def_load_steps_fulfilled is not passed at all and the load is off
+        (def_current_state=[False]), the obligation mask must be all zeros.
+        """
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-5.0)
+        config["min_runtime"] = 4
+        config["heating_rate"] = 1.5
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        self.optim_conf["def_current_state"] = [False]
+        self.optim_conf.pop("def_load_steps_fulfilled", None)
+
+        opt = self.create_optimization()
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        mask = opt.param_obligation_masks[0].value
+        self.assertIsNotNone(mask)
+        self.assertTrue(
+            np.all(mask == 0.0),
+            f"fresh-start obligation mask must be all zeros, got {mask[:8]}",
+        )
 
     def test_def_load_steps_fulfilled_sets_current_state(self):
         """def_load_steps_fulfilled=[1] with min_runtime=2 must mark the load as

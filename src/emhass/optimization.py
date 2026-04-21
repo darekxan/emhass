@@ -3351,6 +3351,10 @@ class Optimization:
         # Read steps_fulfilled directly from optim_conf so the mask is correct on the
         # first call (self._def_load_steps_fulfilled is set later by
         # _update_def_current_state_params, so using getattr would yield stale zeros).
+        # The obligation only applies when the load is currently mid-run; a fresh
+        # start (def_current_state falsy and no steps fulfilled) must produce zero
+        # obligation, otherwise every horizon forces the load on for min_runtime
+        # steps even when the deadband would stay satisfied by doing nothing.
         steps_fulfilled_conf = self.optim_conf.get("def_load_steps_fulfilled", None)
         steps_fulfilled_list = [
             int(steps_fulfilled_conf[k])
@@ -3358,9 +3362,12 @@ class Optimization:
             else 0
             for k in range(num_deferrable_loads)
         ]
+        def_state_conf = self.optim_conf.get("def_current_state", [False] * num_deferrable_loads)
         def_load_config = self.optim_conf.get("def_load_config", []) or []
         for k in range(min(num_deferrable_loads, len(self.param_obligation_masks))):
             steps_fulfilled = steps_fulfilled_list[k] if k < len(steps_fulfilled_list) else 0
+            raw_state = def_state_conf[k] if k < len(def_state_conf) else False
+            currently_on = bool(raw_state) or steps_fulfilled > 0
             min_runtime = 1
             if k < len(def_load_config) and def_load_config[k]:
                 hc = def_load_config[k]
@@ -3368,7 +3375,7 @@ class Optimization:
                 thermal_cfg = hc.get("thermal_config", hc.get("thermal_battery", hc))
                 if thermal_cfg.get("dual_mode_enabled", False):
                     min_runtime = thermal_cfg.get("min_runtime", 1)
-            remaining = max(0, min_runtime - steps_fulfilled)
+            remaining = max(0, min_runtime - steps_fulfilled) if currently_on else 0
             obligation = np.zeros(n)
             obligation[: min(remaining, n)] = 1.0
             self.param_obligation_masks[k].value = obligation
