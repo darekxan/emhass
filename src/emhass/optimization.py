@@ -3223,7 +3223,7 @@ class Optimization:
             var = self.vars.get(var_name)
             if var is not None and var.value is not None:
                 _relax_var(var)
-                fix_constraints.append(var == float(var.value))
+                fix_constraints.append(var == var.value)
 
         n_def = self.optim_conf.get("number_of_deferrable_loads", 0)
         for k in range(n_def):
@@ -3232,18 +3232,18 @@ class Optimization:
                 if bin_vars is not None and k < len(bin_vars) and bin_vars[k].value is not None:
                     var = bin_vars[k]
                     _relax_var(var)
-                    fix_constraints.append(var == float(var.value))
+                    fix_constraints.append(var == var.value)
 
         var = self.vars.get("is_dc_sourcing")
         if var is not None and var.value is not None:
             _relax_var(var)
-            fix_constraints.append(var == float(var.value))
+            fix_constraints.append(var == var.value)
 
         for var_name in ("soc_low_recovered", "soc_high_recovered"):
             var = self.vars.get(var_name)
             if var is not None and var.value is not None:
                 _relax_var(var)
-                fix_constraints.append(var == float(var.value))
+                fix_constraints.append(var == var.value)
 
         # Also relax any dual-mode thermal binary vars
         for k in range(n_def):
@@ -3251,7 +3251,7 @@ class Optimization:
                 var = self.vars.get(var_name)
                 if var is not None and var.value is not None:
                     _relax_var(var)
-                    fix_constraints.append(var == float(var.value))
+                    fix_constraints.append(var == var.value)
 
         fixed_constraints = list(self.all_constraints) + fix_constraints
         fixed_lp = cp.Problem(self.objective_expr, fixed_constraints)
