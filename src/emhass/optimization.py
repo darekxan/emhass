@@ -3307,7 +3307,7 @@ class Optimization:
                     # Convert objective delta to PLN/kWh
                     # delta_obj is in PLN per optimization step (time_step hours)
                     # Shadow price = (delta_obj / (DELTA_W * time_step)) * 1000 W/kW
-                    shadow_prices[i] = delta_obj * (1000.0 / (DELTA_W * self.time_step))
+                    shadow_prices[i] = -delta_obj * (1000.0 / (DELTA_W * self.time_step))
                 else:
                     self.logger.debug(
                         f"Shadow price perturbed solve failed at t={i}: {fixed_lp.status}"
