@@ -1268,12 +1268,12 @@ class Optimization:
 
         # Main Power Balance Constraints
         if self.plant_conf["inverter_is_hybrid"]:
-            constraints.append(
+            self.power_balance_constraint = (
                 p_hybrid_inverter - p_def_sum - p_load + p_grid_neg + p_grid_pos == 0
             )
         else:
             if self.plant_conf["compute_curtailment"]:
-                constraints.append(
+                self.power_balance_constraint = (
                     p_pv
                     - p_pv_curtailment
                     - p_def_sum
@@ -1285,9 +1285,10 @@ class Optimization:
                     == 0
                 )
             else:
-                constraints.append(
+                self.power_balance_constraint = (
                     p_pv - p_def_sum - p_load + p_grid_neg + p_grid_pos + p_sto_pos + p_sto_neg == 0
                 )
+        constraints.append(self.power_balance_constraint)
 
         # Grid Constraints (Vectorized with Time-Varying Limits)
         # p_grid_pos <= max_from_grid[t] * D[t]
@@ -3167,6 +3168,10 @@ class Optimization:
                 q_values = get_val(q_input_var)
                 opt_tp[f"q_input_heater{k}"] = np.round(q_values, 4)
 
+        # Shadow prices (full horizon)
+        if hasattr(self, "shadow_prices") and self.shadow_prices is not None:
+            opt_tp["shadow_price"] = self.shadow_prices
+
         # Debug Columns
         if debug:
             for k in range(self.optim_conf["number_of_deferrable_loads"]):
@@ -3174,6 +3179,77 @@ class Optimization:
                 opt_tp[f"P_def_bin2_{k}"] = get_val(self.vars["p_def_bin2"][k])
 
         return opt_tp
+
+    def _extract_shadow_prices(self, selected_solver, solver_opts):
+        """Extract shadow prices from the solved problem.
+
+        For MILP problems, fixes all binary variables to their optimized values
+        and re-solves as a continuous LP to obtain valid dual variables.
+        For LP problems (relaxed fallback), reads duals directly.
+        """
+        if self.prob.status not in [
+            cp.OPTIMAL,
+            cp.OPTIMAL_INACCURATE,
+            "Optimal (Relaxed)",
+        ]:
+            return None
+
+        # If the current problem already has valid duals (relaxed LP),
+        # read them directly.
+        if (
+            hasattr(self, "power_balance_constraint")
+            and self.power_balance_constraint.dual_value is not None
+        ):
+            duals = np.array(self.power_balance_constraint.dual_value)
+            return -duals * (1000.0 / self.time_step)
+
+        # Otherwise we have a MILP: fix binaries and resolve as LP.
+        fix_constraints = []
+
+        for var_name in ("D", "E"):
+            var = self.vars.get(var_name)
+            if var is not None and var.value is not None:
+                fix_constraints.append(var == var.value)
+
+        n_def = self.optim_conf.get("number_of_deferrable_loads", 0)
+        for k in range(n_def):
+            for bin_name in ("p_def_bin1", "p_def_start", "p_def_bin2"):
+                bin_vars = self.vars.get(bin_name)
+                if bin_vars is not None and k < len(bin_vars) and bin_vars[k].value is not None:
+                    fix_constraints.append(bin_vars[k] == bin_vars[k].value)
+
+        var = self.vars.get("is_dc_sourcing")
+        if var is not None and var.value is not None:
+            fix_constraints.append(var == var.value)
+
+        for var_name in ("soc_low_recovered", "soc_high_recovered"):
+            var = self.vars.get(var_name)
+            if var is not None and var.value is not None:
+                fix_constraints.append(var == var.value)
+
+        fixed_constraints = list(self.all_constraints) + fix_constraints
+        fixed_lp = cp.Problem(self.objective_expr, fixed_constraints)
+
+        try:
+            fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
+        except Exception as e:
+            self.logger.warning(f"Fixed LP solve for shadow prices failed: {e}")
+            return None
+
+        if fixed_lp.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+            self.logger.warning(
+                f"Fixed LP for shadow prices returned status: {fixed_lp.status}"
+            )
+            return None
+
+        if (
+            hasattr(self, "power_balance_constraint")
+            and self.power_balance_constraint.dual_value is not None
+        ):
+            duals = np.array(self.power_balance_constraint.dual_value)
+            return -duals * (1000.0 / self.time_step)
+
+        return None
 
     def perform_optimization(
         self,
@@ -3222,6 +3298,7 @@ class Optimization:
 
             # Force problem rebuild
             self.prob = None
+            self.shadow_prices = None
 
         # Netting-window wall-clock alignment: compute how many head timesteps fall
         # before the first complete window boundary anchored at 00:00.
@@ -3470,6 +3547,7 @@ class Optimization:
 
         # Build Problem (Lazy Construction)
         if self.prob is None:
+            self.shadow_prices = None
             self.logger.info("Building CVXPY problem structure...")
 
             # Start with bound constraints
@@ -3544,6 +3622,8 @@ class Optimization:
                 objective_expr.args[0] += penalty_terms_total
 
             self.prob = cp.Problem(objective_expr, constraints)
+            self.objective_expr = objective_expr
+            self.all_constraints = constraints
 
         # Solver Configuration
         solver_opts = {"verbose": False}
@@ -3707,6 +3787,15 @@ class Optimization:
             # 5. Restore Configuration
             self.optim_conf["treat_deferrable_load_as_semi_cont"] = original_semi_cont
             self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
+
+        # Extract shadow prices
+        self.shadow_prices = self._extract_shadow_prices(selected_solver, solver_opts)
+        if self.shadow_prices is not None:
+            self.logger.info(
+                "Shadow price range: %.3f to %.3f PLN/kWh",
+                float(np.min(self.shadow_prices)),
+                float(np.max(self.shadow_prices)),
+            )
 
         # Fix for Status Case: Map "optimal" -> "Optimal"
         status_raw = self.prob.status
