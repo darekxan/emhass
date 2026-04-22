@@ -3203,29 +3203,55 @@ class Optimization:
             duals = np.array(self.power_balance_constraint.dual_value)
             return -duals * (1000.0 / self.time_step)
 
-        # Otherwise we have a MILP: fix binaries and resolve as LP.
+        # Otherwise we have a MILP: fix binaries, relax them to continuous,
+        # and re-solve as an LP so the solver populates dual values.
         fix_constraints = []
+        original_attrs = {}  # var -> {"boolean": bool, "integer": bool}
+
+        def _relax_var(var):
+            """Store and strip boolean/integer attrs so solver sees a continuous var."""
+            if var is None:
+                return
+            original_attrs[var] = {
+                "boolean": getattr(var, "boolean", False),
+                "integer": getattr(var, "integer", False),
+            }
+            var.boolean = False
+            var.integer = False
 
         for var_name in ("D", "E"):
             var = self.vars.get(var_name)
             if var is not None and var.value is not None:
-                fix_constraints.append(var == var.value)
+                _relax_var(var)
+                fix_constraints.append(var == float(var.value))
 
         n_def = self.optim_conf.get("number_of_deferrable_loads", 0)
         for k in range(n_def):
             for bin_name in ("p_def_bin1", "p_def_start", "p_def_bin2"):
                 bin_vars = self.vars.get(bin_name)
                 if bin_vars is not None and k < len(bin_vars) and bin_vars[k].value is not None:
-                    fix_constraints.append(bin_vars[k] == bin_vars[k].value)
+                    var = bin_vars[k]
+                    _relax_var(var)
+                    fix_constraints.append(var == float(var.value))
 
         var = self.vars.get("is_dc_sourcing")
         if var is not None and var.value is not None:
-            fix_constraints.append(var == var.value)
+            _relax_var(var)
+            fix_constraints.append(var == float(var.value))
 
         for var_name in ("soc_low_recovered", "soc_high_recovered"):
             var = self.vars.get(var_name)
             if var is not None and var.value is not None:
-                fix_constraints.append(var == var.value)
+                _relax_var(var)
+                fix_constraints.append(var == float(var.value))
+
+        # Also relax any dual-mode thermal binary vars
+        for k in range(n_def):
+            for var_name in (f"heat_active_{k}", f"cool_active_{k}"):
+                var = self.vars.get(var_name)
+                if var is not None and var.value is not None:
+                    _relax_var(var)
+                    fix_constraints.append(var == float(var.value))
 
         fixed_constraints = list(self.all_constraints) + fix_constraints
         fixed_lp = cp.Problem(self.objective_expr, fixed_constraints)
@@ -3234,22 +3260,39 @@ class Optimization:
             fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
         except Exception as e:
             self.logger.warning(f"Fixed LP solve for shadow prices failed: {e}")
+            # Restore attrs before returning
+            for var, attrs in original_attrs.items():
+                var.boolean = attrs["boolean"]
+                var.integer = attrs["integer"]
             return None
 
         if fixed_lp.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
             self.logger.warning(
                 f"Fixed LP for shadow prices returned status: {fixed_lp.status}"
             )
+            for var, attrs in original_attrs.items():
+                var.boolean = attrs["boolean"]
+                var.integer = attrs["integer"]
             return None
 
+        shadow_prices = None
         if (
             hasattr(self, "power_balance_constraint")
             and self.power_balance_constraint.dual_value is not None
         ):
             duals = np.array(self.power_balance_constraint.dual_value)
-            return -duals * (1000.0 / self.time_step)
+            shadow_prices = -duals * (1000.0 / self.time_step)
+        else:
+            self.logger.warning(
+                "Fixed LP solved but power_balance_constraint dual_value is None"
+            )
 
-        return None
+        # Restore original boolean/integer attributes
+        for var, attrs in original_attrs.items():
+            var.boolean = attrs["boolean"]
+            var.integer = attrs["integer"]
+
+        return shadow_prices
 
     def perform_optimization(
         self,
