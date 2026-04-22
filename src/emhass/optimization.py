@@ -123,6 +123,7 @@ class Optimization:
         self.logger.debug(f"Optimization configuration: {optim_conf}")
         self.logger.debug(f"Plant configuration: {plant_conf}")
         self.logger.debug(f"Number of threads: {self.num_threads}")
+        self.logger.info(f"Installed CVXPY solvers: {cp.installed_solvers()}")
 
         # CVXPY Initialization
         # Calculate the fixed number of time steps (N)
@@ -3181,11 +3182,13 @@ class Optimization:
         return opt_tp
 
     def _extract_shadow_prices(self, selected_solver, solver_opts):
-        """Extract shadow prices from the solved problem.
+        """Extract shadow prices using finite differences on a fixed LP.
 
-        For MILP problems, fixes all binary variables to their optimized values
-        and re-solves as a continuous LP to obtain valid dual variables.
-        For LP problems (relaxed fallback), reads duals directly.
+        Fixes all binary variables to their MILP-optimal values and solves
+        a pure continuous LP. Then perturbs the load forecast by a small
+        delta at each timestep, re-solves, and computes the marginal cost
+        from the objective change. This avoids dependence on dual values
+        which are not reliably populated by CVXPY/HiGHS for MILPs.
         """
         if self.prob.status not in [
             cp.OPTIMAL,
@@ -3203,8 +3206,7 @@ class Optimization:
             duals = np.array(self.power_balance_constraint.dual_value)
             return -duals * (1000.0 / self.time_step)
 
-        # Otherwise we have a MILP: fix binaries, relax them to continuous,
-        # and re-solve as an LP so the solver populates dual values.
+        # --- Build fixed LP: fix all binary variables, relax to continuous ---
         fix_constraints = []
         original_attrs = {}  # var -> {"boolean": bool, "integer": bool}
 
@@ -3245,7 +3247,6 @@ class Optimization:
                 _relax_var(var)
                 fix_constraints.append(var == var.value)
 
-        # Also relax any dual-mode thermal binary vars
         for k in range(n_def):
             for var_name in (f"heat_active_{k}", f"cool_active_{k}"):
                 var = self.vars.get(var_name)
@@ -3260,7 +3261,6 @@ class Optimization:
             fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
         except Exception as e:
             self.logger.warning(f"Fixed LP solve for shadow prices failed: {e}")
-            # Restore attrs before returning
             for var, attrs in original_attrs.items():
                 var.boolean = attrs["boolean"]
                 var.integer = attrs["integer"]
@@ -3275,23 +3275,56 @@ class Optimization:
                 var.integer = attrs["integer"]
             return None
 
-        shadow_prices = None
-        if (
-            hasattr(self, "power_balance_constraint")
-            and self.power_balance_constraint.dual_value is not None
-        ):
-            duals = np.array(self.power_balance_constraint.dual_value)
-            shadow_prices = -duals * (1000.0 / self.time_step)
-        else:
-            self.logger.warning(
-                "Fixed LP solved but power_balance_constraint dual_value is None"
-            )
+        base_obj = fixed_lp.value
+        if base_obj is None:
+            for var, attrs in original_attrs.items():
+                var.boolean = attrs["boolean"]
+                var.integer = attrs["integer"]
+            return None
+
+        # --- Finite-difference shadow prices ---
+        n = self.num_timesteps
+        DELTA_W = 10.0  # perturbation in Watts
+        shadow_prices = np.full(n, np.nan)
+        original_load = np.array(self.param_load_forecast.value).copy()
+
+        # Solve base fixed LP once more to warm-start the cache
+        self.param_load_forecast.value = original_load
+        try:
+            fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
+        except Exception:
+            pass
+
+        for i in range(n):
+            perturbed_load = original_load.copy()
+            perturbed_load[i] += DELTA_W
+            self.param_load_forecast.value = perturbed_load
+
+            try:
+                fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
+                if fixed_lp.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE] and fixed_lp.value is not None:
+                    delta_obj = fixed_lp.value - base_obj
+                    # Convert objective delta to PLN/kWh
+                    # delta_obj is in PLN per optimization step (time_step hours)
+                    # Shadow price = (delta_obj / (DELTA_W * time_step)) * 1000 W/kW
+                    shadow_prices[i] = delta_obj * (1000.0 / (DELTA_W * self.time_step))
+                else:
+                    self.logger.debug(
+                        f"Shadow price perturbed solve failed at t={i}: {fixed_lp.status}"
+                    )
+            except Exception as e:
+                self.logger.debug(f"Shadow price perturbed solve crashed at t={i}: {e}")
+
+        # Restore original load parameter
+        self.param_load_forecast.value = original_load
 
         # Restore original boolean/integer attributes
         for var, attrs in original_attrs.items():
             var.boolean = attrs["boolean"]
             var.integer = attrs["integer"]
 
+        if np.isnan(shadow_prices).all():
+            return None
         return shadow_prices
 
     def perform_optimization(
