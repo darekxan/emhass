@@ -2521,7 +2521,7 @@ async def _publish_ev_cost_curve(ctx: PublishContext) -> None:
         await ctx.rh.post_data(
             pd.Series(),
             0,
-            "sensor.ev_cost_curve",
+            entity_id,
             "monetary",
             "PLN",
             "EV Cost Curve",
