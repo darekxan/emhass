@@ -3419,8 +3419,9 @@ class Optimization:
             target_soc = target.get("target_soc")
             ev_hours = target.get("ev_hours", 0)
 
-            # Enforce minimum 2 timesteps to avoid fractional-hour infeasibility
-            ev_hours = max(ev_hours, self.time_step * 2)
+            # Enforce minimum 1 timestep for non-zero targets to avoid fractional-hour infeasibility
+            if ev_hours > 0:
+                ev_hours = max(ev_hours, self.time_step)
 
             # Update EV energy constraint parameters
             k = 1
