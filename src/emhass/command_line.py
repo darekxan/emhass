@@ -1525,8 +1525,8 @@ async def naive_mpc_optim(
     sweep_results = getattr(input_data_dict["opt"], "soc_sweep_results", None)
     if sweep_results:
         sweep_path = input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
-        with open(sweep_path, "w") as f:
-            orjson.dump(sweep_results, f)
+        with open(sweep_path, "wb") as f:
+            f.write(orjson.dumps(sweep_results))
         logger.info(f"Saved SOC sweep results ({len(sweep_results)} targets) to {sweep_path}")
     # Save CSV file for publish_data
     if save_data_to_file:
