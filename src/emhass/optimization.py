@@ -3327,6 +3327,178 @@ class Optimization:
             return None
         return shadow_prices
 
+    def perform_soc_sweep(
+        self,
+        soc_sweep_targets: list[dict] | None,
+        selected_solver,
+        solver_opts,
+    ) -> list[dict]:
+        """Run a parametric SOC sweep by fixing non-EV binaries and re-solving for each target."""
+        if not soc_sweep_targets:
+            return []
+
+        if self.prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE, "Optimal (Relaxed)"]:
+            self.logger.warning("Cannot perform SOC sweep: main solve not optimal")
+            return []
+
+        baseline_obj = self.prob.value
+        if baseline_obj is None:
+            self.logger.warning("Cannot perform SOC sweep: main solve has no objective value")
+            return []
+
+        # Fix non-EV binaries
+        fix_constraints = []
+        original_attrs = {}
+
+        def _relax_var(var):
+            if var is None:
+                return
+            original_attrs[var] = {
+                "boolean": getattr(var, "boolean", False),
+                "integer": getattr(var, "integer", False),
+            }
+            var.boolean = False
+            var.integer = False
+
+        n_def = self.optim_conf.get("number_of_deferrable_loads", 0)
+
+        # Fix D, E (battery binaries)
+        for var_name in ("D", "E"):
+            var = self.vars.get(var_name)
+            if var is not None and var.value is not None:
+                _relax_var(var)
+                fix_constraints.append(var == var.value)
+
+        # Fix non-EV deferrable load binaries
+        for k in range(n_def):
+            if k == 1:  # Skip EV load
+                continue
+            for bin_name in ("p_def_bin1", "p_def_start", "p_def_bin2"):
+                bin_vars = self.vars.get(bin_name)
+                if bin_vars is not None and k < len(bin_vars) and bin_vars[k].value is not None:
+                    var = bin_vars[k]
+                    _relax_var(var)
+                    fix_constraints.append(var == var.value)
+
+        # Fix is_dc_sourcing
+        var = self.vars.get("is_dc_sourcing")
+        if var is not None and var.value is not None:
+            _relax_var(var)
+            fix_constraints.append(var == var.value)
+
+        # Fix soc_recovered
+        for var_name in ("soc_low_recovered", "soc_high_recovered"):
+            var = self.vars.get(var_name)
+            if var is not None and var.value is not None:
+                _relax_var(var)
+                fix_constraints.append(var == var.value)
+
+        # Fix heat_active / cool_active for non-EV loads
+        for k in range(n_def):
+            if k == 1:
+                continue
+            for var_name in (f"heat_active_{k}", f"cool_active_{k}"):
+                var = self.vars.get(var_name)
+                if var is not None and var.value is not None:
+                    _relax_var(var)
+                    fix_constraints.append(var == var.value)
+
+        # Build sweep problem
+        sweep_constraints = list(self.all_constraints) + fix_constraints
+        sweep_problem = cp.Problem(self.objective_expr, sweep_constraints)
+
+        # Get EV nominal power
+        nominal_power_ev = self.optim_conf["nominal_power_of_deferrable_loads"][1]
+        if isinstance(nominal_power_ev, list):
+            nominal_power_ev = max(nominal_power_ev)
+
+        results = []
+
+        for target in soc_sweep_targets:
+            target_soc = target.get("target_soc")
+            ev_hours = target.get("ev_hours", 0)
+
+            # Update EV energy constraint parameters
+            k = 1
+            if ev_hours > 0:
+                required_timesteps = ceil(ev_hours / self.time_step)
+                target_energy = nominal_power_ev * ev_hours
+                self.param_target_energy[k].value = target_energy
+                self.param_energy_active[k].value = 1.0
+                is_single_const = self.optim_conf["set_deferrable_load_single_constant"][k]
+                if is_single_const:
+                    self.param_required_timesteps[k].value = required_timesteps
+                    self.param_timesteps_active[k].value = 1.0
+                else:
+                    self.param_required_timesteps[k].value = 0.0
+                    self.param_timesteps_active[k].value = 0.0
+                self.param_load_active[k].value = 1.0
+            else:
+                self.param_target_energy[k].value = 0.0
+                self.param_energy_active[k].value = 0.0
+                self.param_required_timesteps[k].value = 0.0
+                self.param_timesteps_active[k].value = 0.0
+                self.param_load_active[k].value = 0.0
+
+            try:
+                sweep_problem.solve(solver=selected_solver, warm_start=True, **solver_opts)
+                if sweep_problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE] and sweep_problem.value is not None:
+                    cost_delta = baseline_obj - sweep_problem.value
+
+                    # Extract EV schedule
+                    p_deferrable = self.vars.get("p_deferrable")
+                    ev_schedule = []
+                    if p_deferrable is not None and len(p_deferrable) > k:
+                        ev_schedule = [float(p_deferrable[k][i].value) for i in range(self.num_timesteps)]
+
+                    start_ts = None
+                    end_ts = None
+                    for i, p in enumerate(ev_schedule):
+                        if p > 10.0:
+                            if start_ts is None:
+                                start_ts = i
+                            end_ts = i
+
+                    ev_kwh = sum(ev_schedule) * self.time_step / 1000.0 if ev_schedule else 0.0
+
+                    results.append({
+                        "target_soc": target_soc,
+                        "cost": round(float(cost_delta), 2),
+                        "ev_charge_start_ts": start_ts if start_ts is not None else -1,
+                        "ev_charge_end_ts": end_ts if end_ts is not None else -1,
+                        "ev_kwh": round(ev_kwh, 2),
+                    })
+                else:
+                    self.logger.warning(f"SOC sweep solve failed for target {target_soc}: {sweep_problem.status}")
+                    results.append({
+                        "target_soc": target_soc,
+                        "cost": None,
+                        "ev_charge_start_ts": -1,
+                        "ev_charge_end_ts": -1,
+                        "ev_kwh": 0.0,
+                    })
+            except Exception as e:
+                self.logger.warning(f"SOC sweep solve crashed for target {target_soc}: {e}")
+                results.append({
+                    "target_soc": target_soc,
+                    "cost": None,
+                    "ev_charge_start_ts": -1,
+                    "ev_charge_end_ts": -1,
+                    "ev_kwh": 0.0,
+                })
+
+        # Restore boolean/integer attributes
+        for var, attrs in original_attrs.items():
+            var.boolean = attrs["boolean"]
+            var.integer = attrs["integer"]
+
+        valid_costs = [r["cost"] for r in results if r["cost"] is not None]
+        if valid_costs:
+            self.logger.info(
+                f"SOC sweep completed: {len(results)} targets, cost range {min(valid_costs):.2f} to {max(valid_costs):.2f}"
+            )
+        return results
+
     def perform_optimization(
         self,
         data_opt: pd.DataFrame,
@@ -3343,6 +3515,7 @@ class Optimization:
         def_init_temp: list | None = None,
         min_power_of_deferrable_loads: list | None = None,
         debug: bool | None = False,
+        soc_sweep_targets: list[dict] | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform the actual optimization using Convex Programming (CVXPY).
@@ -3877,6 +4050,11 @@ class Optimization:
             self.shadow_prices = None
             self.logger.info("Skipping shadow price extraction (skip_shadow_price_extraction=true)")
 
+        # Parametric SOC sweep for EV cost curve
+        self.soc_sweep_results = self.perform_soc_sweep(
+            soc_sweep_targets, selected_solver, solver_opts
+        )
+
         # Fix for Status Case: Map "optimal" -> "Optimal"
         status_raw = self.prob.status
         self.optim_status = status_raw.title() if status_raw else "Failure"
@@ -4043,6 +4221,7 @@ class Optimization:
         def_total_timestep: list | None = None,
         def_start_timestep: list | None = None,
         def_end_timestep: list | None = None,
+        soc_sweep_targets: list[dict] | None = None,
     ) -> pd.DataFrame:
         r"""
         Perform a naive approach to a Model Predictive Control (MPC). \
@@ -4120,6 +4299,7 @@ class Optimization:
             def_total_timestep=def_total_timestep,
             def_start_timestep=def_start_timestep,
             def_end_timestep=def_end_timestep,
+            soc_sweep_targets=soc_sweep_targets,
         )
         return self.opt_res
 

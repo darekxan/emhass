@@ -1506,6 +1506,7 @@ async def naive_mpc_optim(
     def_end_timestep = input_data_dict["params"]["optim_conf"][
         "end_timesteps_of_each_deferrable_load"
     ]
+    soc_sweep_targets = input_data_dict["params"]["passed_data"].get("soc_sweep_targets", None)
     opt_res_naive_mpc = await asyncio.to_thread(
         input_data_dict["opt"].perform_naive_mpc_optim,
         df_input_data_dayahead,
@@ -1518,7 +1519,15 @@ async def naive_mpc_optim(
         def_total_timestep,
         def_start_timestep,
         def_end_timestep,
+        soc_sweep_targets,
     )
+    # Save SOC sweep results to JSON for publish_data
+    sweep_results = getattr(input_data_dict["opt"], "soc_sweep_results", None)
+    if sweep_results:
+        sweep_path = input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
+        with open(sweep_path, "w") as f:
+            orjson.dump(sweep_results, f)
+        logger.info(f"Saved SOC sweep results ({len(sweep_results)} targets) to {sweep_path}")
     # Save CSV file for publish_data
     if save_data_to_file:
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2474,6 +2483,42 @@ async def _publish_grid_and_costs(ctx: PublishContext, opt_res_latest: pd.DataFr
     return cols
 
 
+async def _publish_ev_cost_curve(ctx: PublishContext) -> None:
+    """Publish EV cost curve from saved sweep results."""
+    sweep_path = ctx.input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
+    if not sweep_path.exists():
+        return
+    try:
+        with open(sweep_path) as f:
+            sweep_results = orjson.loads(f.read())
+        if not sweep_results:
+            return
+        entity_id = f"sensor.{ctx.common_kwargs.get('publish_prefix', '')}ev_cost_curve"
+        custom_data = {
+            "state": str(len(sweep_results)),
+            "attributes": {
+                "device_class": "monetary",
+                "unit_of_measurement": "PLN",
+                "friendly_name": "EV Cost Curve",
+                "cost_curve_forecast": sweep_results,
+            },
+        }
+        await ctx.rh.post_data(
+            pd.Series(),
+            0,
+            "sensor.ev_cost_curve",
+            "monetary",
+            "PLN",
+            "EV Cost Curve",
+            type_var="ev_cost_curve",
+            custom_data=custom_data,
+            **{k: v for k, v in ctx.common_kwargs.items() if k != "publish_prefix"},
+        )
+        ctx.logger.info(f"Published EV cost curve with {len(sweep_results)} points")
+    except Exception as e:
+        ctx.logger.warning(f"Failed to publish EV cost curve: {e}")
+
+
 async def publish_data(
     input_data_dict: dict,
     logger: logging.Logger,
@@ -2535,6 +2580,8 @@ async def publish_data(
     cols_published.extend(await _publish_thermal_loads(ctx, opt_res_latest))
     cols_published.extend(await _publish_battery_data(ctx, opt_res_latest))
     cols_published.extend(await _publish_grid_and_costs(ctx, opt_res_latest))
+    # Publish EV cost curve if available
+    await _publish_ev_cost_curve(ctx)
     # Return Summary DataFrame
     opt_res = opt_res_latest[cols_published].loc[[opt_res_latest.index[idx_closest]]]
     return opt_res

@@ -1093,6 +1093,7 @@ class RetrieveHass:
         save_entities: bool | None = False,
         logger_levels: str | None = "info",
         dont_post: bool | None = False,
+        custom_data: dict | None = None,
     ) -> None:
         r"""
         Post passed data to hass using REST API.
@@ -1139,7 +1140,9 @@ class RetrieveHass:
             "content-type": header_accept,
         }
         # Preparing the data dict to be published
-        if type_var == "cost_fun":
+        if custom_data is not None:
+            data = custom_data
+        elif type_var == "cost_fun":
             if isinstance(data_df.iloc[0], pd.Series):  # if Series extract
                 data_df = data_df.iloc[:, 0]
             state = np.round(data_df.sum(), 2)
