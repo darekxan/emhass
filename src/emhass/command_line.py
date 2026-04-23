@@ -1551,6 +1551,23 @@ async def naive_mpc_optim(
     ].get("entity_save", False):
         # Trigger the publish function, save entity data and not post to HA
         await publish_data(input_data_dict, logger, entity_save=True, dont_post=True)
+    else:
+        # Publish EV cost curve directly when standard publish_data is not triggered
+        sweep_path = input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
+        if sweep_path.exists():
+            publish_prefix = params["passed_data"].get("publish_prefix", "")
+            ctx = PublishContext(
+                input_data_dict=input_data_dict,
+                params=params,
+                idx=0,
+                common_kwargs={
+                    "publish_prefix": publish_prefix,
+                    "save_entities": False,
+                    "dont_post": False,
+                },
+                logger=logger,
+            )
+            await _publish_ev_cost_curve(ctx)
 
     return opt_res_naive_mpc
 
@@ -2510,7 +2527,8 @@ async def _publish_ev_cost_curve(ctx: PublishContext) -> None:
             "EV Cost Curve",
             type_var="ev_cost_curve",
             custom_data=custom_data,
-            **{k: v for k, v in ctx.common_kwargs.items() if k != "publish_prefix"},
+            dont_post=False,
+            **{k: v for k, v in ctx.common_kwargs.items() if k not in ("publish_prefix", "dont_post")},
         )
         ctx.logger.info(f"Published EV cost curve with {len(sweep_results)} points")
     except Exception as e:
