@@ -3865,13 +3865,17 @@ class Optimization:
             self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
 
         # Extract shadow prices
-        self.shadow_prices = self._extract_shadow_prices(selected_solver, solver_opts)
-        if self.shadow_prices is not None:
-            self.logger.info(
-                "Shadow price range: %.3f to %.3f PLN/kWh",
-                float(np.min(self.shadow_prices)),
-                float(np.max(self.shadow_prices)),
-            )
+        if not self.optim_conf.get("skip_shadow_price_extraction", False):
+            self.shadow_prices = self._extract_shadow_prices(selected_solver, solver_opts)
+            if self.shadow_prices is not None:
+                self.logger.info(
+                    "Shadow price range: %.3f to %.3f PLN/kWh",
+                    float(np.min(self.shadow_prices)),
+                    float(np.max(self.shadow_prices)),
+                )
+        else:
+            self.shadow_prices = None
+            self.logger.info("Skipping shadow price extraction (skip_shadow_price_extraction=true)")
 
         # Fix for Status Case: Map "optimal" -> "Optimal"
         status_raw = self.prob.status
