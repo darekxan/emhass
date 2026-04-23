@@ -3335,6 +3335,7 @@ class Optimization:
     ) -> list[dict]:
         """Run a parametric SOC sweep by fixing non-EV binaries and re-solving for each target."""
         if not soc_sweep_targets:
+            self.logger.info("SOC sweep skipped: no soc_sweep_targets provided")
             return []
 
         if self.prob.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE, "Optimal (Relaxed)"]:

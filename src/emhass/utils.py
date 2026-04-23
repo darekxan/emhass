@@ -1449,6 +1449,10 @@ async def treat_runtimeparams(
         if "skip_shadow_price_extraction" in runtimeparams:
             params["optim_conf"]["skip_shadow_price_extraction"] = runtimeparams["skip_shadow_price_extraction"]
 
+        # Allow parametric SOC sweep for EV cost curve
+        if "soc_sweep_targets" in runtimeparams:
+            params["passed_data"]["soc_sweep_targets"] = runtimeparams["soc_sweep_targets"]
+
         # Generate forecast_dates
         # Force update optimization_time_step if present in runtimeparams
         if "optimization_time_step" in runtimeparams:
