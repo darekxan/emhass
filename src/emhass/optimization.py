@@ -3418,6 +3418,9 @@ class Optimization:
             target_soc = target.get("target_soc")
             ev_hours = target.get("ev_hours", 0)
 
+            # Enforce minimum 2 timesteps to avoid fractional-hour infeasibility
+            ev_hours = max(ev_hours, self.time_step * 2)
+
             # Update EV energy constraint parameters
             k = 1
             if ev_hours > 0:
@@ -3469,7 +3472,7 @@ class Optimization:
                         "ev_kwh": round(ev_kwh, 2),
                     })
                 else:
-                    self.logger.warning(f"SOC sweep solve failed for target {target_soc}: {sweep_problem.status}")
+                    self.logger.info(f"SOC sweep solve failed for target {target_soc}: {sweep_problem.status}")
                     results.append({
                         "target_soc": target_soc,
                         "cost": None,
@@ -3478,7 +3481,7 @@ class Optimization:
                         "ev_kwh": 0.0,
                     })
             except Exception as e:
-                self.logger.warning(f"SOC sweep solve crashed for target {target_soc}: {e}")
+                self.logger.info(f"SOC sweep solve crashed for target {target_soc}: {e}")
                 results.append({
                     "target_soc": target_soc,
                     "cost": None,
@@ -3496,6 +3499,10 @@ class Optimization:
         if valid_costs:
             self.logger.info(
                 f"SOC sweep completed: {len(results)} targets, cost range {min(valid_costs):.2f} to {max(valid_costs):.2f}"
+            )
+        else:
+            self.logger.info(
+                f"SOC sweep completed: {len(results)} targets, none feasible or optimal"
             )
         return results
 

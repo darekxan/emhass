@@ -2491,8 +2491,6 @@ async def _publish_ev_cost_curve(ctx: PublishContext) -> None:
     try:
         with open(sweep_path) as f:
             sweep_results = orjson.loads(f.read())
-        if not sweep_results:
-            return
         entity_id = f"sensor.{ctx.common_kwargs.get('publish_prefix', '')}ev_cost_curve"
         custom_data = {
             "state": str(len(sweep_results)),
