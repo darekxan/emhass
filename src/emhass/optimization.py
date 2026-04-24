@@ -3452,6 +3452,63 @@ class Optimization:
             ev_kwh = sum(ev_schedule) * self.time_step / 1000.0 if ev_schedule else 0.0
             return ev_schedule, (start_ts if start_ts is not None else -1), (end_ts if end_ts is not None else -1), ev_kwh
 
+        def _compute_ev_penalty_cost():
+            """Compute the EV portion of startup, overhead, and transition penalties."""
+            penalty_cost = 0.0
+            scale = 0.001 * self.time_step
+            unit_load_cost_arr = self.param_load_cost.value
+
+            # Startup penalty
+            startup_penalties = self.optim_conf.get(
+                "set_deferrable_startup_penalty", []
+            )
+            if k < len(startup_penalties) and startup_penalties[k] > 0:
+                p_def_start = self.vars.get("p_def_start")
+                if p_def_start is not None and k < len(p_def_start):
+                    nominal_power = self.optim_conf["nominal_power_of_deferrable_loads"][k]
+                    if isinstance(nominal_power, list):
+                        nominal_power = max(nominal_power)
+                    startup_sum = sum(
+                        float(p_def_start[k][i].value) * float(unit_load_cost_arr[i])
+                        for i in range(self.num_timesteps)
+                    )
+                    penalty_cost += scale * startup_penalties[k] * nominal_power * startup_sum
+
+            # Running overhead
+            running_overheads = self.optim_conf.get(
+                "set_deferrable_load_running_overhead", []
+            )
+            if k < len(running_overheads) and running_overheads[k] > 0:
+                p_def_bin2 = self.vars.get("p_def_bin2")
+                if p_def_bin2 is not None and k < len(p_def_bin2):
+                    overhead_sum = sum(
+                        float(p_def_bin2[k][i].value) * float(unit_load_cost_arr[i])
+                        for i in range(self.num_timesteps)
+                    )
+                    penalty_cost += scale * running_overheads[k] * overhead_sum
+
+            # Power transition cost
+            transition_costs = self.optim_conf.get(
+                "set_deferrable_load_transition_cost", []
+            )
+            if k < len(transition_costs) and transition_costs[k] > 0:
+                p_def_delta_plus = self.vars.get("p_def_delta_plus")
+                p_def_delta_minus = self.vars.get("p_def_delta_minus")
+                if (
+                    p_def_delta_plus is not None
+                    and k < len(p_def_delta_plus)
+                    and p_def_delta_minus is not None
+                    and k < len(p_def_delta_minus)
+                ):
+                    trans_sum = sum(
+                        float(p_def_delta_plus[k][i].value)
+                        + float(p_def_delta_minus[k][i].value)
+                        for i in range(self.num_timesteps)
+                    )
+                    penalty_cost += scale * transition_costs[k] * trans_sum
+
+            return penalty_cost
+
         # Snapshot .value of every CVXPY Variable in self.vars so the sweep is
         # fully side-effect free.  Without this the sweep's last iteration leaves
         # its values in place and _build_results_dataframe reads them instead of
@@ -3507,6 +3564,7 @@ class Optimization:
                         results.append({
                             "target_soc": baseline_from_input.get("target_soc"),
                             "cost": 0.0,
+                            "cost_energy": 0.0,
                             "ev_charge_start_ts": start_ts,
                             "ev_charge_end_ts": end_ts,
                             "ev_kwh": round(ev_kwh, 2),
@@ -3526,6 +3584,7 @@ class Optimization:
                         results.append({
                             "target_soc": baseline_from_input.get("target_soc"),
                             "cost": None,
+                            "cost_energy": None,
                             "ev_charge_start_ts": start_ts,
                             "ev_charge_end_ts": end_ts,
                             "ev_kwh": round(ev_kwh, 2),
@@ -3537,6 +3596,7 @@ class Optimization:
                     results.append({
                         "target_soc": baseline_from_input.get("target_soc"),
                         "cost": None,
+                        "cost_energy": None,
                         "ev_charge_start_ts": start_ts,
                         "ev_charge_end_ts": end_ts,
                         "ev_kwh": round(ev_kwh, 2),
@@ -3557,13 +3617,17 @@ class Optimization:
                         if sweep_baseline_value is not None:
                             cost_delta = sweep_baseline_value - sweep_problem.value
                             cost_rounded = round(float(cost_delta), 2)
+                            penalty_cost = _compute_ev_penalty_cost()
+                            cost_energy = round(float(cost_delta - penalty_cost), 2)
                         else:
                             cost_rounded = None
+                            cost_energy = None
 
                         _, start_ts, end_ts, ev_kwh = _extract_ev_result()
                         results.append({
                             "target_soc": target_soc,
                             "cost": cost_rounded,
+                            "cost_energy": cost_energy,
                             "ev_charge_start_ts": start_ts,
                             "ev_charge_end_ts": end_ts,
                             "ev_kwh": round(ev_kwh, 2),
@@ -3575,6 +3639,7 @@ class Optimization:
                         results.append({
                             "target_soc": target_soc,
                             "cost": None,
+                            "cost_energy": None,
                             "ev_charge_start_ts": -1,
                             "ev_charge_end_ts": -1,
                             "ev_kwh": 0.0,
@@ -3586,6 +3651,7 @@ class Optimization:
                     results.append({
                         "target_soc": target_soc,
                         "cost": None,
+                        "cost_energy": None,
                         "ev_charge_start_ts": -1,
                         "ev_charge_end_ts": -1,
                         "ev_kwh": 0.0,
