@@ -1483,7 +1483,6 @@ async def naive_mpc_optim(
 
     """
     logger.info("Performing naive MPC optimization")
-    logger.info("EMHASS hotpatch active: custom ghi_forecast MPC support enabled")
     # Prepare forecast data with costs, prices, outdoor temp, and GHI (with resolution warning)
     df_input_data_dayahead = prepare_forecast_and_weather_data(
         input_data_dict, logger, warn_on_resolution=True
