@@ -3342,11 +3342,6 @@ class Optimization:
             self.logger.warning("Cannot perform SOC sweep: main solve not optimal")
             return []
 
-        baseline_obj = self.prob.value
-        if baseline_obj is None:
-            self.logger.warning("Cannot perform SOC sweep: main solve has no objective value")
-            return []
-
         # Fix non-EV binaries
         fix_constraints = []
         original_attrs = {}
@@ -3413,68 +3408,181 @@ class Optimization:
         if isinstance(nominal_power_ev, list):
             nominal_power_ev = max(nominal_power_ev)
 
-        results = []
+        k = 1  # EV deferrable load index
 
-        for target in soc_sweep_targets:
-            target_soc = target.get("target_soc")
-            ev_hours = target.get("ev_hours", 0)
+        # Helper: set EV parameters for baseline (disabled)
+        def _set_ev_params_baseline():
+            self.param_load_active[k].value = 0.0
+            self.param_energy_active[k].value = 0.0
+            self.param_target_energy[k].value = 0.0
+            self.param_required_timesteps[k].value = 0.0
+            self.param_timesteps_active[k].value = 0.0
 
-            # Enforce minimum 1 timestep for non-zero targets to avoid fractional-hour infeasibility
-            if ev_hours > 0:
-                ev_hours = max(ev_hours, self.time_step)
-
-            # Update EV energy constraint parameters
-            k = 1
-            if ev_hours > 0:
-                required_timesteps = ceil(ev_hours / self.time_step)
-                target_energy = nominal_power_ev * ev_hours
-                self.param_target_energy[k].value = target_energy
-                self.param_energy_active[k].value = 1.0
-                is_single_const = self.optim_conf["set_deferrable_load_single_constant"][k]
-                if is_single_const:
-                    self.param_required_timesteps[k].value = required_timesteps
-                    self.param_timesteps_active[k].value = 1.0
-                else:
-                    self.param_required_timesteps[k].value = 0.0
-                    self.param_timesteps_active[k].value = 0.0
-                self.param_load_active[k].value = 1.0
+        # Helper: set EV parameters for a target charge
+        def _set_ev_params_target(ev_hours: float):
+            ev_hours = max(ev_hours, self.time_step)
+            required_timesteps = ceil(ev_hours / self.time_step)
+            target_energy = nominal_power_ev * ev_hours
+            self.param_target_energy[k].value = target_energy
+            self.param_energy_active[k].value = 1.0
+            is_single_const = self.optim_conf["set_deferrable_load_single_constant"][k]
+            if is_single_const:
+                self.param_required_timesteps[k].value = required_timesteps
+                self.param_timesteps_active[k].value = 1.0
             else:
-                self.param_target_energy[k].value = 0.0
-                self.param_energy_active[k].value = 0.0
                 self.param_required_timesteps[k].value = 0.0
                 self.param_timesteps_active[k].value = 0.0
-                self.param_load_active[k].value = 0.0
+            self.param_load_active[k].value = 1.0
 
+        # Helper: extract EV schedule metadata from current variable values
+        def _extract_ev_result():
+            p_deferrable = self.vars.get("p_deferrable")
+            ev_schedule = []
+            if p_deferrable is not None and len(p_deferrable) > k:
+                ev_schedule = [float(p_deferrable[k][i].value) for i in range(self.num_timesteps)]
+
+            start_ts = None
+            end_ts = None
+            for i, p in enumerate(ev_schedule):
+                if p > 10.0:
+                    if start_ts is None:
+                        start_ts = i
+                    end_ts = i
+
+            ev_kwh = sum(ev_schedule) * self.time_step / 1000.0 if ev_schedule else 0.0
+            return ev_schedule, (start_ts if start_ts is not None else -1), (end_ts if end_ts is not None else -1), ev_kwh
+
+        # Snapshot .value of every CVXPY Variable in self.vars so the sweep is
+        # fully side-effect free.  Without this the sweep's last iteration leaves
+        # its values in place and _build_results_dataframe reads them instead of
+        # the main-solve values.
+        value_snapshot = {}
+        for key, obj in self.vars.items():
+            if isinstance(obj, cp.Variable):
+                v = obj.value
+                value_snapshot[key] = None if v is None else (
+                    np.copy(v) if hasattr(v, "copy") else v
+                )
+            elif isinstance(obj, list):
+                snap_list = []
+                for item in obj:
+                    if isinstance(item, cp.Variable):
+                        iv = item.value
+                        snap_list.append(
+                            None if iv is None else (
+                                np.copy(iv) if hasattr(iv, "copy") else iv
+                            )
+                        )
+                    else:
+                        snap_list.append(None)
+                value_snapshot[key] = snap_list
+
+        results = []
+
+        try:
+            # Phase A: Baseline solve (EV disabled)
+            baseline_from_input = None
+            for t in soc_sweep_targets:
+                if t.get("ev_hours", 0) == 0:
+                    baseline_from_input = t
+                    break
+
+            baseline_count = sum(1 for t in soc_sweep_targets if t.get("ev_hours", 0) == 0)
+            if baseline_count > 1:
+                self.logger.warning(
+                    f"SOC sweep: {baseline_count} ev_hours=0 entries; using first"
+                )
+
+            _set_ev_params_baseline()
+            sweep_baseline_value = None
             try:
                 sweep_problem.solve(solver=selected_solver, warm_start=True, **solver_opts)
                 if sweep_problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE] and sweep_problem.value is not None:
-                    cost_delta = baseline_obj - sweep_problem.value
-
-                    # Extract EV schedule
-                    p_deferrable = self.vars.get("p_deferrable")
-                    ev_schedule = []
-                    if p_deferrable is not None and len(p_deferrable) > k:
-                        ev_schedule = [float(p_deferrable[k][i].value) for i in range(self.num_timesteps)]
-
-                    start_ts = None
-                    end_ts = None
-                    for i, p in enumerate(ev_schedule):
-                        if p > 10.0:
-                            if start_ts is None:
-                                start_ts = i
-                            end_ts = i
-
-                    ev_kwh = sum(ev_schedule) * self.time_step / 1000.0 if ev_schedule else 0.0
-
+                    sweep_baseline_value = sweep_problem.value
+                    self.logger.debug(
+                        f"SOC sweep baseline solved: value={sweep_baseline_value:.4f}"
+                    )
+                    if baseline_from_input is not None:
+                        _, start_ts, end_ts, ev_kwh = _extract_ev_result()
+                        results.append({
+                            "target_soc": baseline_from_input.get("target_soc"),
+                            "cost": 0.0,
+                            "ev_charge_start_ts": start_ts,
+                            "ev_charge_end_ts": end_ts,
+                            "ev_kwh": round(ev_kwh, 2),
+                        })
+                    else:
+                        self.logger.info(
+                            "SOC sweep: no ev_hours=0 target provided; "
+                            "synthesizing baseline for delta computation"
+                        )
+                else:
+                    self.logger.warning(
+                        f"SOC sweep baseline solve failed ({sweep_problem.status}); "
+                        "all non-baseline cost deltas will be None"
+                    )
+                    if baseline_from_input is not None:
+                        _, start_ts, end_ts, ev_kwh = _extract_ev_result()
+                        results.append({
+                            "target_soc": baseline_from_input.get("target_soc"),
+                            "cost": None,
+                            "ev_charge_start_ts": start_ts,
+                            "ev_charge_end_ts": end_ts,
+                            "ev_kwh": round(ev_kwh, 2),
+                        })
+            except Exception as e:
+                self.logger.warning(f"SOC sweep baseline solve crashed: {e}")
+                if baseline_from_input is not None:
+                    _, start_ts, end_ts, ev_kwh = _extract_ev_result()
                     results.append({
-                        "target_soc": target_soc,
-                        "cost": round(float(cost_delta), 2),
-                        "ev_charge_start_ts": start_ts if start_ts is not None else -1,
-                        "ev_charge_end_ts": end_ts if end_ts is not None else -1,
+                        "target_soc": baseline_from_input.get("target_soc"),
+                        "cost": None,
+                        "ev_charge_start_ts": start_ts,
+                        "ev_charge_end_ts": end_ts,
                         "ev_kwh": round(ev_kwh, 2),
                     })
-                else:
-                    self.logger.info(f"SOC sweep solve failed for target {target_soc}: {sweep_problem.status}")
+
+            # Phase B: non-baseline targets (ascending SOC)
+            non_baseline = [t for t in soc_sweep_targets if t.get("ev_hours", 0) != 0]
+            sorted_targets = sorted(non_baseline, key=lambda t: t.get("target_soc", 0))
+
+            for target in sorted_targets:
+                target_soc = target.get("target_soc")
+                ev_hours = target.get("ev_hours", 0)
+                _set_ev_params_target(ev_hours)
+
+                try:
+                    sweep_problem.solve(solver=selected_solver, warm_start=True, **solver_opts)
+                    if sweep_problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE] and sweep_problem.value is not None:
+                        if sweep_baseline_value is not None:
+                            cost_delta = sweep_baseline_value - sweep_problem.value
+                            cost_rounded = round(float(cost_delta), 2)
+                        else:
+                            cost_rounded = None
+
+                        _, start_ts, end_ts, ev_kwh = _extract_ev_result()
+                        results.append({
+                            "target_soc": target_soc,
+                            "cost": cost_rounded,
+                            "ev_charge_start_ts": start_ts,
+                            "ev_charge_end_ts": end_ts,
+                            "ev_kwh": round(ev_kwh, 2),
+                        })
+                    else:
+                        self.logger.info(
+                            f"SOC sweep solve failed for target {target_soc}: {sweep_problem.status}"
+                        )
+                        results.append({
+                            "target_soc": target_soc,
+                            "cost": None,
+                            "ev_charge_start_ts": -1,
+                            "ev_charge_end_ts": -1,
+                            "ev_kwh": 0.0,
+                        })
+                except Exception as e:
+                    self.logger.info(
+                        f"SOC sweep solve crashed for target {target_soc}: {e}"
+                    )
                     results.append({
                         "target_soc": target_soc,
                         "cost": None,
@@ -3482,20 +3590,26 @@ class Optimization:
                         "ev_charge_end_ts": -1,
                         "ev_kwh": 0.0,
                     })
-            except Exception as e:
-                self.logger.info(f"SOC sweep solve crashed for target {target_soc}: {e}")
-                results.append({
-                    "target_soc": target_soc,
-                    "cost": None,
-                    "ev_charge_start_ts": -1,
-                    "ev_charge_end_ts": -1,
-                    "ev_kwh": 0.0,
-                })
 
-        # Restore boolean/integer attributes
-        for var, attrs in original_attrs.items():
-            var.boolean = attrs["boolean"]
-            var.integer = attrs["integer"]
+        finally:
+            # Restore boolean/integer attributes so the main problem stays valid
+            for var, attrs in original_attrs.items():
+                var.boolean = attrs["boolean"]
+                var.integer = attrs["integer"]
+
+            # Restore .value of every shared Variable so _build_results_dataframe
+            # reads main-solve values, not the sweep's last-iteration values.
+            for key, saved in value_snapshot.items():
+                obj = self.vars.get(key)
+                if isinstance(obj, cp.Variable):
+                    obj.value = saved
+                elif isinstance(obj, list) and isinstance(saved, list):
+                    for idx, item in enumerate(obj):
+                        if isinstance(item, cp.Variable) and idx < len(saved):
+                            item.value = saved[idx]
+
+        # Sort results ascending by target_soc so the frontend sees baseline first
+        results.sort(key=lambda r: r.get("target_soc", 0))
 
         valid_costs = [r["cost"] for r in results if r["cost"] is not None]
         if valid_costs:
@@ -3506,6 +3620,7 @@ class Optimization:
             self.logger.info(
                 f"SOC sweep completed: {len(results)} targets, none feasible or optimal"
             )
+
         return results
 
     def perform_optimization(
@@ -3791,6 +3906,20 @@ class Optimization:
                 self.param_load_active[k].value = 0.0
                 self.logger.debug(
                     f"Deferrable load {k}: deactivated (no operating timesteps, not thermal)"
+                )
+
+        # Apply def_load_enabled overrides: force disabled loads to inactive regardless of
+        # operating hours or thermal status. This ensures a load that is semantically off
+        # (e.g. EV disconnected) cannot appear in the main solve even if sweep targets are
+        # present or parameters are accidentally non-zero.
+        def_load_enabled = self.optim_conf.get(
+            "def_load_enabled", [True] * num_deferrable_loads
+        )
+        for k in range(min(num_deferrable_loads, len(self.param_load_active))):
+            if k < len(def_load_enabled) and not def_load_enabled[k]:
+                self.param_load_active[k].value = 0.0
+                self.logger.debug(
+                    f"Deferrable load {k}: disabled via def_load_enabled"
                 )
 
         # Update min-power parameters so cached problems use the current call's values
