@@ -53,6 +53,9 @@ entity_path: Path = Path()
 params_secrets: dict[str, str | float] = {}
 continual_publish_thread: list = []
 injection_dict: dict = {}
+emhass_version: str = "unknown"
+emhass_build_type: str = "unknown"
+emhass_git_sha: str = ""
 
 templates = jinja2.Environment(
     autoescape=True,
@@ -196,7 +199,14 @@ async def index():
         injection_dict = {}
 
     template = templates.get_template("index.html")
-    return await make_response(template.render(injection_dict=injection_dict))
+    return await make_response(
+        template.render(
+            injection_dict=injection_dict,
+            emhass_version=emhass_version,
+            emhass_build_type=emhass_build_type,
+            emhass_git_sha=emhass_git_sha,
+        )
+    )
 
 
 @app.route("/configuration", methods=["GET", "POST"])
@@ -265,7 +275,14 @@ async def configuration():
         params = {}
 
     template = templates.get_template("configuration.html")
-    return await make_response(template.render(config=params))
+    return await make_response(
+        template.render(
+            config=params,
+            emhass_version=emhass_version,
+            emhass_build_type=emhass_build_type,
+            emhass_git_sha=emhass_git_sha,
+        )
+    )
 
 
 @app.route("/template", methods=["GET"])
@@ -312,6 +329,10 @@ async def parameter_get():
         return await make_response([error_msg_associations_file], 500)
     # Covert formatted parameters from params back into config.json format
     return_config = param_to_config(params, app.logger)
+    # Append build metadata so clients can identify the running version
+    return_config["emhass_version"] = emhass_version
+    return_config["emhass_build_type"] = emhass_build_type
+    return_config["emhass_git_sha"] = emhass_git_sha
     # Send config
     return await make_response(return_config, 201)
 
@@ -883,6 +904,7 @@ async def _initialize_connections(params: dict) -> None:
 
 async def initialize(args: dict | None = None):
     global emhass_conf, params_secrets, continual_publish_thread, injection_dict, entity_path
+    global emhass_version, emhass_build_type, emhass_git_sha
     # Grab the logging level early from ENV so initialization functions can log properly
     early_log_level = os.getenv("LOGGING_LEVEL", "INFO")
     normalized_log_level = early_log_level.upper()
@@ -928,10 +950,20 @@ async def initialize(args: dict | None = None):
     app.logger.info("The data path is: " + str(emhass_conf["data_path"]))
     app.logger.info("The config path is: " + str(emhass_conf["config_path"]))
     app.logger.info("The logging is: " + str(logging_level))
+    # Resolve version, build type, and git SHA
+    emhass_build_type = os.environ.get("EMHASS_BUILD_TYPE", "dev")
+    emhass_git_sha = os.environ.get("EMHASS_GIT_SHA", "")
     try:
-        app.logger.info("Using core emhass version: " + version("emhass"))
+        emhass_version = version("emhass")
     except PackageNotFoundError:
-        app.logger.info("Using development emhass version")
+        emhass_version = "dev"
+    version_label = "v" + emhass_version
+    if emhass_build_type != "release":
+        version_label += " (" + emhass_build_type
+        if emhass_git_sha:
+            version_label += ": " + emhass_git_sha[:7]
+        version_label += ")"
+    app.logger.info("Using emhass " + version_label)
     # Initialize Connections (WebSocket/InfluxDB)
     await _initialize_connections(params)
     app.logger.info("Initialization complete")

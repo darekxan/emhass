@@ -72,7 +72,7 @@
 
             <footer class="footer">
                 <p style="margin-top:10px; text-align:center;">&copy; MIT License | Copyright (c) 2021-2025 David
-                    HERNANDEZ</p>
+                    HERNANDEZ | v{{ emhass_version }}{% if emhass_build_type != 'release' %} ({{ emhass_build_type }}{% if emhass_git_sha %}: {{ emhass_git_sha[:7] }}{% endif %}){% endif %}</p>
             </footer>
 </body>
 
