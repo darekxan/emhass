@@ -1451,6 +1451,16 @@ async def treat_runtimeparams(
                 "skip_shadow_price_extraction"
             ]
 
+        # Allow parametric SOC sweep for EV cost curve
+        if "soc_sweep_targets" in runtimeparams:
+            params["passed_data"]["soc_sweep_targets"] = runtimeparams["soc_sweep_targets"]
+
+        # Allow hard-disabling individual deferrable loads in the main solve
+        if "def_load_enabled" in runtimeparams:
+            params["optim_conf"]["def_load_enabled"] = [
+                bool(v) for v in runtimeparams["def_load_enabled"]
+            ]
+
         # Generate forecast_dates
         # Force update optimization_time_step if present in runtimeparams
         if "optimization_time_step" in runtimeparams:

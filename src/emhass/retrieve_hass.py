@@ -1093,6 +1093,7 @@ class RetrieveHass:
         save_entities: bool | None = False,
         logger_levels: str | None = "info",
         dont_post: bool | None = False,
+        custom_data: dict | None = None,
     ) -> None:
         r"""
         Post passed data to hass using REST API.
@@ -1139,7 +1140,9 @@ class RetrieveHass:
             "content-type": header_accept,
         }
         # Preparing the data dict to be published
-        if type_var == "cost_fun":
+        if custom_data is not None:
+            data = custom_data
+        elif type_var == "cost_fun":
             if isinstance(data_df.iloc[0], pd.Series):  # if Series extract
                 data_df = data_df.iloc[:, 0]
             state = np.round(data_df.sum(), 2)
@@ -1151,144 +1154,145 @@ class RetrieveHass:
             state = float(data_df[idx])
         else:
             state = np.round(data_df.loc[data_df.index[idx]], 2)
-        if type_var == "power":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "forecasts",
-                state,
-            )
-        elif type_var == "deferrable":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "deferrables_schedule",
-                state,
-            )
-        elif type_var == "temperature":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "predicted_temperatures",
-                state,
-            )
-        elif type_var == "batt":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "battery_scheduled_power",
-                state,
-            )
-        elif type_var == "SOC":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "battery_scheduled_soc",
-                state,
-            )
-        elif type_var == "unit_load_cost":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "unit_load_cost_forecasts",
-                state,
-                decimals=4,
-            )
-        elif type_var == "unit_prod_price":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "unit_prod_price_forecasts",
-                state,
-                decimals=4,
-            )
-        elif type_var == "shadow_price":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "shadow_price_forecasts",
-                state,
-                decimals=4,
-            )
-        elif type_var == "mlforecaster":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "scheduled_forecast",
-                state,
-            )
-        elif type_var == "energy":
-            data = RetrieveHass.get_attr_data_dict(
-                data_df,
-                idx,
-                entity_id,
-                device_class,
-                unit_of_measurement,
-                friendly_name,
-                "heating_demand_forecast",
-                state,
-            )
-        elif type_var == "optim_status":
-            data = {
-                "state": state,
-                "attributes": {
-                    "friendly_name": friendly_name,
-                },
-            }
-        elif type_var == "mlregressor":
-            data = {
-                "state": state,
-                "attributes": {
-                    "device_class": device_class,
-                    "unit_of_measurement": unit_of_measurement,
-                    "friendly_name": friendly_name,
-                },
-            }
-        else:
-            data = {
-                "state": f"{state:.2f}",
-                "attributes": {
-                    "device_class": device_class,
-                    "unit_of_measurement": unit_of_measurement,
-                    "friendly_name": friendly_name,
-                },
-            }
+        if custom_data is None:
+            if type_var == "power":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "forecasts",
+                    state,
+                )
+            elif type_var == "deferrable":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "deferrables_schedule",
+                    state,
+                )
+            elif type_var == "temperature":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "predicted_temperatures",
+                    state,
+                )
+            elif type_var == "batt":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "battery_scheduled_power",
+                    state,
+                )
+            elif type_var == "SOC":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "battery_scheduled_soc",
+                    state,
+                )
+            elif type_var == "unit_load_cost":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "unit_load_cost_forecasts",
+                    state,
+                    decimals=4,
+                )
+            elif type_var == "unit_prod_price":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "unit_prod_price_forecasts",
+                    state,
+                    decimals=4,
+                )
+            elif type_var == "shadow_price":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "shadow_price_forecasts",
+                    state,
+                    decimals=4,
+                )
+            elif type_var == "mlforecaster":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "scheduled_forecast",
+                    state,
+                )
+            elif type_var == "energy":
+                data = RetrieveHass.get_attr_data_dict(
+                    data_df,
+                    idx,
+                    entity_id,
+                    device_class,
+                    unit_of_measurement,
+                    friendly_name,
+                    "heating_demand_forecast",
+                    state,
+                )
+            elif type_var == "optim_status":
+                data = {
+                    "state": state,
+                    "attributes": {
+                        "friendly_name": friendly_name,
+                    },
+                }
+            elif type_var == "mlregressor":
+                data = {
+                    "state": state,
+                    "attributes": {
+                        "device_class": device_class,
+                        "unit_of_measurement": unit_of_measurement,
+                        "friendly_name": friendly_name,
+                    },
+                }
+            else:
+                data = {
+                    "state": f"{state:.2f}",
+                    "attributes": {
+                        "device_class": device_class,
+                        "unit_of_measurement": unit_of_measurement,
+                        "friendly_name": friendly_name,
+                    },
+                }
         # Actually post the data
         if self.get_data_from_file or dont_post:
             # Create mock response for file mode or dont_post mode
@@ -1322,13 +1326,14 @@ class RetrieveHass:
 
         # Treating the response status and posting them on the logger
         if response_ok:
+            log_value = data.get("state", "custom") if custom_data is not None else state
             if logger_levels == "DEBUG" or dont_post:
-                self.logger.debug("Successfully posted to " + entity_id + " = " + str(state))
+                self.logger.debug("Successfully posted to " + entity_id + " = " + str(log_value))
             else:
-                self.logger.info("Successfully posted to " + entity_id + " = " + str(state))
+                self.logger.info("Successfully posted to " + entity_id + " = " + str(log_value))
 
             # If save entities is set, save entity data to /data_path/entities
-            if save_entities:
+            if save_entities and custom_data is None:
                 entities_path = self.emhass_conf["data_path"] / "entities"
 
                 # Clarify folder exists
