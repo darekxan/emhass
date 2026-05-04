@@ -76,6 +76,8 @@ Here is the list of the other additional dictionary keys that can be passed at r
 
 - `def_current_state` Pass this as a list of booleans (True/False) to indicate the current deferrable load state. This is used internally to avoid incorrectly penalizing a deferrable load start if a forecast is run when that load is already running.
 
+- `def_load_steps_fulfilled` Pass this as a list of integers (one per deferrable load) to indicate how many consecutive timesteps each load has already been running before this horizon. Used with `min_runtime` on dual-mode thermal loads to carry the remaining run obligation across MPC calls. For example, if `min_runtime=4` and the load has been running for 2 timesteps, pass `2` — the optimizer will force the load on for the first 2 timesteps of the new horizon. A value of `0` means the load was off. Any non-zero value also implies the load is currently on (supersedes `def_current_state` for that load).
+
 - `treat_deferrable_load_as_semi_cont` to define if we should treat each deferrable load as a semi-continuous variable.
 
 - `set_deferrable_load_single_constant` to define if we should set each deferrable load as a constant fixed value variable with just one startup for each optimization task.

@@ -4725,6 +4725,178 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                         f"min_runtime={min_rt} violated at t=0: mode switched off at t={i}",
                     )
 
+    # ── def_load_steps_fulfilled tests ─────────────────────────────────────────
+
+    def _run_steps_fulfilled_optimization(self, steps_fulfilled, min_runtime=4, outdoor_temps=-5.0):
+        """Helper: run dual-mode thermal_config optimization with def_load_steps_fulfilled.
+
+        Returns (opt_res, opt) so callers can inspect both the result DataFrame and
+        the Optimization object (e.g. to check param values).
+        """
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=outdoor_temps)
+        config["min_runtime"] = min_runtime
+        config["heating_rate"] = 1.5
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        self.optim_conf["def_load_steps_fulfilled"] = steps_fulfilled
+
+        opt = self.create_optimization()
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt_res = opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+        self.assertIsInstance(opt_res, type(pd.DataFrame()))
+        return opt_res, opt
+
+    def test_def_load_steps_fulfilled_forces_on_remaining_steps(self):
+        """def_load_steps_fulfilled=[2] with min_runtime=4 must force the heat pump
+        on at t=0 and t=1 (the 2 remaining obligated timesteps).
+
+        The obligation mask encodes `remaining = min_runtime - steps_fulfilled = 2`,
+        so obligation_mask[0]=1 and obligation_mask[1]=1. Combined with mutual
+        exclusivity (heat + cool <= 1), the solver is forced to pick exactly one
+        active mode at each of those timesteps.
+        """
+        opt_res, opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[2], min_runtime=4)
+
+        heat = opt_res["heat_active0"].values
+        cool = opt_res["cool_active0"].values
+        active_t0 = heat[0] + cool[0]
+        active_t1 = heat[1] + cool[1]
+
+        self.assertGreaterEqual(
+            active_t0,
+            1 - 1e-6,
+            f"Expected heat_active + cool_active >= 1 at t=0 (obligation), got {active_t0:.6f}",
+        )
+        self.assertGreaterEqual(
+            active_t1,
+            1 - 1e-6,
+            f"Expected heat_active + cool_active >= 1 at t=1 (obligation), got {active_t1:.6f}",
+        )
+
+    def test_def_load_steps_fulfilled_no_obligation_when_fully_met(self):
+        """def_load_steps_fulfilled=[4] with min_runtime=4 means the obligation is
+        already fully satisfied: remaining = max(0, 4-4) = 0, so no forced-on steps.
+
+        The optimization must solve successfully (no infeasibility from the mask).
+        The optimizer is free at t=0 — we do NOT assert it must be on.
+        """
+        opt_res, _opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[4], min_runtime=4)
+
+        # Must solve and return a DataFrame with expected columns
+        self.assertIsInstance(opt_res, type(pd.DataFrame()))
+        self.assertIn("heat_active0", opt_res.columns)
+        self.assertIn("cool_active0", opt_res.columns)
+        # Mutual exclusivity must hold everywhere
+        mutual = opt_res["heat_active0"] + opt_res["cool_active0"]
+        self.assertTrue(
+            (mutual <= 1 + 1e-6).all(),
+            "Mutual exclusivity violated after steps_fulfilled=min_runtime",
+        )
+
+    def test_def_load_steps_fulfilled_zero_means_no_obligation(self):
+        """def_load_steps_fulfilled=[0] must produce a zero obligation mask: the
+        load is not mid-run, so no timestep can be forced on.
+
+        Regression: before the def_current_state gate, remaining was computed as
+        min_runtime - 0 = min_runtime, forcing the load on for the first
+        min_runtime steps of every fresh horizon.
+        """
+        self.optim_conf["def_current_state"] = [False]
+        _opt_res, opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[0], min_runtime=4)
+
+        mask = opt.param_obligation_masks[0].value
+        self.assertIsNotNone(mask, "param_obligation_masks[0].value must not be None")
+        self.assertTrue(
+            np.all(mask == 0.0),
+            f"obligation mask must be all zeros when load is not mid-run, got {mask[:8]}",
+        )
+
+    def test_obligation_mask_zero_when_steps_fulfilled_missing(self):
+        """When def_load_steps_fulfilled is not passed at all and the load is off
+        (def_current_state=[False]), the obligation mask must be all zeros.
+        """
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-5.0)
+        config["min_runtime"] = 4
+        config["heating_rate"] = 1.5
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        self.optim_conf["def_current_state"] = [False]
+        self.optim_conf.pop("def_load_steps_fulfilled", None)
+
+        opt = self.create_optimization()
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        mask = opt.param_obligation_masks[0].value
+        self.assertIsNotNone(mask)
+        self.assertTrue(
+            np.all(mask == 0.0),
+            f"fresh-start obligation mask must be all zeros, got {mask[:8]}",
+        )
+
+    def test_def_load_steps_fulfilled_sets_current_state(self):
+        """def_load_steps_fulfilled=[1] with min_runtime=2 must mark the load as
+        currently ON (param_def_current_state[0].value == 1.0) because steps > 0
+        implies the load was running before the current horizon.
+        """
+        _opt_res, opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[1], min_runtime=2)
+
+        self.assertAlmostEqual(
+            opt.param_def_current_state[0].value,
+            1.0,
+            places=6,
+            msg="def_load_steps_fulfilled=[1] must set param_def_current_state[0]=1.0",
+        )
+
+    def test_def_load_steps_fulfilled_obligation_mask_values(self):
+        """After perform_optimization, param_obligation_masks[0] must reflect the
+        remaining obligation: for steps_fulfilled=2 and min_runtime=4 the first 2
+        entries must be 1.0 and the rest must be 0.0.
+
+        The mask is computed from optim_conf during perform_optimization, so it
+        is available immediately after the first call.
+        """
+        _opt_res, opt = self._run_steps_fulfilled_optimization(steps_fulfilled=[2], min_runtime=4)
+
+        mask = opt.param_obligation_masks[0].value
+        self.assertIsNotNone(mask, "param_obligation_masks[0].value must not be None")
+        self.assertIsInstance(mask, np.ndarray, "obligation mask must be a numpy array")
+
+        remaining = 2  # min_runtime(4) - steps_fulfilled(2)
+        for t in range(remaining):
+            self.assertAlmostEqual(
+                mask[t],
+                1.0,
+                places=6,
+                msg=f"obligation_mask[{t}] must be 1.0 (obligated timestep)",
+            )
+        for t in range(remaining, len(mask)):
+            self.assertAlmostEqual(
+                mask[t],
+                0.0,
+                places=6,
+                msg=f"obligation_mask[{t}] must be 0.0 (free timestep)",
+            )
+
     def test_thermal_battery_dual_mode_transition_cooldown_feasible_after_multi_step_cool(self):
         """transition_cooldown must remain feasible when cooling runs for multiple
         consecutive steps (>1).
