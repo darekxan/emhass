@@ -2296,17 +2296,9 @@ class Optimization:
             p_heat = cp.Variable(required_len, nonneg=True, name=f"p_heat_{k}")
             p_cool = cp.Variable(required_len, nonneg=True, name=f"p_cool_{k}")
 
-            # Create mode indicators. The relaxed retry keeps these continuous so
-            # thermal fallback can become a real LP instead of rebuilding another MIP.
-            relax_mode_binaries = getattr(self, "_relax_thermal_mode_binaries", False)
-            if relax_mode_binaries:
-                heat_active = cp.Variable(required_len, nonneg=True, name=f"heat_active_{k}")
-                cool_active = cp.Variable(required_len, nonneg=True, name=f"cool_active_{k}")
-                constraints.append(heat_active <= 1)
-                constraints.append(cool_active <= 1)
-            else:
-                heat_active = cp.Variable(required_len, boolean=True, name=f"heat_active_{k}")
-                cool_active = cp.Variable(required_len, boolean=True, name=f"cool_active_{k}")
+            # Create binary mode indicators.
+            heat_active = cp.Variable(required_len, boolean=True, name=f"heat_active_{k}")
+            cool_active = cp.Variable(required_len, boolean=True, name=f"cool_active_{k}")
 
             # Store in class variables for later access
             self.vars[f"p_heat_{k}"] = p_heat
@@ -4218,14 +4210,12 @@ class Optimization:
                 self.optim_conf.get("set_deferrable_load_single_constant", [])
             )
             original_relax_comfort = getattr(self, "_relax_thermal_comfort_bounds", False)
-            original_relax_modes = getattr(self, "_relax_thermal_mode_binaries", False)
 
             # Relax Configuration: Disable Binary Logic
             n_def = self.optim_conf["number_of_deferrable_loads"]
             self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * n_def
             self.optim_conf["set_deferrable_load_single_constant"] = [False] * n_def
             self._relax_thermal_comfort_bounds = True
-            self._relax_thermal_mode_binaries = True
 
             # Re-build Constraints (Clean Slate)
             constraints_relaxed = self.constraints[:]  # Start with base bound constraints
@@ -4294,7 +4284,6 @@ class Optimization:
             self.optim_conf["treat_deferrable_load_as_semi_cont"] = original_semi_cont
             self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
             self._relax_thermal_comfort_bounds = original_relax_comfort
-            self._relax_thermal_mode_binaries = original_relax_modes
 
         # Extract shadow prices
         if not self.optim_conf.get("skip_shadow_price_extraction", False):
