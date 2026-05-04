@@ -43,7 +43,8 @@ See below for a list of associations between the parameters from `config_emhass.
 | optim_conf |  set_use_pv |  set_use_pv | |
 | optim_conf |  set_use_battery |  set_use_battery | |
 | optim_conf |  num_def_loads |  number_of_deferrable_loads | |
-| optim_conf |  P_deferrable_nom |  list_nominal_power_of_deferrable_loads |  nominal_power_of_deferrable_loads | 
+| optim_conf |  P_deferrable_nom |  list_nominal_power_of_deferrable_loads |  nominal_power_of_deferrable_loads |
+| optim_conf |  P_deferrable_min |  list_minimum_power_of_deferrable_loads |  minimum_power_of_deferrable_loads |
 | optim_conf |  def_total_hours |  list_operating_hours_of_each_deferrable_load |  operating_hours_of_each_deferrable_load | 
 | optim_conf |  treat_def_as_semi_cont |  list_treat_deferrable_load_as_semi_cont |  treat_deferrable_load_as_semi_cont | 
 | optim_conf |  set_def_constant |  list_set_deferrable_load_single_constant |  set_deferrable_load_single_constant | 

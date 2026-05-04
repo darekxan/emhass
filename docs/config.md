@@ -61,6 +61,9 @@ These are the parameters needed to properly define the optimization problem.
 - `nominal_power_of_deferrable_loads`: The nominal power for each deferrable load in Watts. This is a list with a number of elements consistent with the number of deferrable loads defined before. For example:
 	- 3000
 	- 750
+- `minimum_power_of_deferrable_loads`: The minimum power for each deferrable load in Watts. When a load is active (on), its power will be constrained to at least this value. Use this to model loads that cannot run below a certain wattage (e.g. a heat pump that must run at ≥ 1000 W when on). Defaults to 0 for each load (no minimum). A nonzero value enables binary on/off logic for that load; this structural decision is made when the optimization problem is first built, so set a nonzero initial value in config if you intend to update it at runtime. For example:
+	- 1000
+	- 0
 - `operating_hours_of_each_deferrable_load`: The total number of hours that each deferrable load should operate. For example:
 	- 5
 	- 8

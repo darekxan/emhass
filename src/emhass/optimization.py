@@ -234,6 +234,21 @@ class Optimization:
             p = cp.Parameter(nonneg=True, name=f"load_active_{k}")
             p.value = 1.0  # Default: all loads active
             self.param_load_active.append(p)
+
+        # Minimum power parameters: allow updating min-power values on cached problems
+        # without rebuilding the CVXPY problem structure. The structural decision
+        # (has_min_power / binary logic) is still made at build time from optim_conf.
+        min_power_init = self.optim_conf.get(
+            "minimum_power_of_deferrable_loads", [0.0] * num_def_loads
+        )
+        if min_power_init is None or len(min_power_init) < num_def_loads:
+            min_power_init = (list(min_power_init or []) + [0.0] * num_def_loads)[:num_def_loads]
+        self.param_min_power = []
+        for k in range(num_def_loads):
+            p = cp.Parameter(nonneg=True, name=f"min_power_{k}")
+            p.value = float(min_power_init[k])
+            self.param_min_power.append(p)
+
         # Thermal Parameters for warm-starting
         # Dict keyed by load index k, stores all parameters needed for thermal constraints
         # This allows updating runtime values (forecasts, temperatures) without rebuilding constraints
@@ -905,6 +920,8 @@ class Optimization:
         p_def_bin1 = []
         p_def_start = []
         p_def_bin2 = []
+        p_def_delta_plus = []
+        p_def_delta_minus = []
 
         for k in range(num_deferrable_loads):
             # Calculate Upper Bound
@@ -925,10 +942,16 @@ class Optimization:
             p_def_start.append(cp.Variable(n, boolean=True, name=f"p_def_start_{k}"))
             p_def_bin2.append(cp.Variable(n, boolean=True, name=f"p_def_bin2_{k}"))
 
+            # Auxiliary variables for absolute-value power-transition linearization
+            p_def_delta_plus.append(cp.Variable(n, nonneg=True, name=f"p_def_delta_plus_{k}"))
+            p_def_delta_minus.append(cp.Variable(n, nonneg=True, name=f"p_def_delta_minus_{k}"))
+
         vars_dict["p_deferrable"] = p_deferrable
         vars_dict["p_def_bin1"] = p_def_bin1
         vars_dict["p_def_start"] = p_def_start
         vars_dict["p_def_bin2"] = p_def_bin2
+        vars_dict["p_def_delta_plus"] = p_def_delta_plus
+        vars_dict["p_def_delta_minus"] = p_def_delta_minus
 
         # Binary indicators for Grid and Battery direction
         vars_dict["D"] = cp.Variable(n, boolean=True, name="D")
@@ -1082,6 +1105,35 @@ class Optimization:
 
                     term = -scale * penalty * nominal_power * total_startup_cost
                     objective_terms.append(term)
+
+        # Deferrable Load Running Overhead
+        # A static per-timestep penalty (in W) for each timestep a load is active.
+        # This makes connection time costly, biasing the solver toward fewer,
+        # higher-power (shorter) charging sessions.
+        running_overhead = self.optim_conf.get("set_deferrable_load_running_overhead", [])
+        if running_overhead:
+            p_def_bin2 = self.vars["p_def_bin2"]
+            for k in range(self.optim_conf["number_of_deferrable_loads"]):
+                overhead = running_overhead[k] if k < len(running_overhead) else 0.0
+                if overhead <= 0 or k >= len(p_def_bin2):
+                    continue
+                overhead_cost = cp.multiply(p_def_bin2[k], unit_load_cost)
+                objective_terms.append(-scale * overhead * cp.sum(overhead_cost))
+
+        # Deferrable Load Power Transition Cost
+        # Penalises |P[t] - P[t-1]| to discourage rapid power-level changes on
+        # continuous (non-semi-continuous) loads such as variable EV chargers.
+        # Uses the auxiliary delta_plus/delta_minus variables added in constraint building.
+        transition_costs = self.optim_conf.get("set_deferrable_load_transition_cost", [])
+        if transition_costs:
+            p_def_delta_plus = self.vars["p_def_delta_plus"]
+            p_def_delta_minus = self.vars["p_def_delta_minus"]
+            for k in range(self.optim_conf["number_of_deferrable_loads"]):
+                tc = transition_costs[k] if k < len(transition_costs) else 0.0
+                if tc <= 0:
+                    continue
+                total_transition = cp.sum(p_def_delta_plus[k] + p_def_delta_minus[k])
+                objective_terms.append(-scale * tc * total_transition)
 
         # Stress Costs
         # These variables represent a cost to be minimized.
@@ -2636,6 +2688,8 @@ class Optimization:
                 "set_deferrable_startup_penalty" in self.optim_conf
                 and self.optim_conf["set_deferrable_startup_penalty"][k] > 0
             )
+            _running_overhead_list = self.optim_conf.get("set_deferrable_load_running_overhead", [])
+            has_running_overhead = k < len(_running_overhead_list) and _running_overhead_list[k] > 0
 
             # Check if we MUST use binary logic
             use_binary_logic = (
@@ -2644,6 +2698,7 @@ class Optimization:
                 or is_single_const
                 or has_min_power
                 or has_startup_penalty
+                or has_running_overhead
             )
 
             if use_binary_logic:
@@ -2658,9 +2713,7 @@ class Optimization:
 
                 # Minimum Power (if active)
                 if has_min_power:
-                    constraints.append(
-                        p_deferrable[k] >= min_power_of_deferrable_loads[k] * p_def_bin2[k]
-                    )
+                    constraints.append(p_deferrable[k] >= self.param_min_power[k] * p_def_bin2[k])
 
                 # Status consistency: P_def <= M * Bin2
                 # Use the Dynamic M calculated above (Critical for performance)
@@ -2725,6 +2778,27 @@ class Optimization:
                 # Just bound by nominal power. No binary variables involved.
                 constraints.append(p_deferrable[k] >= 0)
                 constraints.append(p_deferrable[k] <= M)
+
+        # Power-transition cost constraints (absolute-value linearization)
+        # Penalises |P[t] - P[t-1]| to smooth continuous load profiles.
+        # Only added when set_deferrable_load_transition_cost[k] > 0.
+        transition_costs = self.optim_conf.get(
+            "set_deferrable_load_transition_cost",
+            [0.0] * self.optim_conf["number_of_deferrable_loads"],
+        )
+        p_def_delta_plus = self.vars["p_def_delta_plus"]
+        p_def_delta_minus = self.vars["p_def_delta_minus"]
+        for k in range(self.optim_conf["number_of_deferrable_loads"]):
+            tc = transition_costs[k] if k < len(transition_costs) else 0.0
+            if tc > 0:
+                # t=0: no previous step, fix deltas to zero
+                constraints.append(p_def_delta_plus[k][0] == 0)
+                constraints.append(p_def_delta_minus[k][0] == 0)
+                for t in range(1, n):
+                    constraints.append(
+                        p_deferrable[k][t] - p_deferrable[k][t - 1]
+                        == p_def_delta_plus[k][t] - p_def_delta_minus[k][t]
+                    )
 
         return predicted_temps, heating_demands, penalty_terms_total, q_inputs, solar_gains
 
@@ -3181,8 +3255,16 @@ class Optimization:
                     f"Deferrable load {k}: deactivated (no operating timesteps, not thermal)"
                 )
 
+        # Update min-power parameters so cached problems use the current call's values
+        for k in range(min(num_deferrable_loads, len(self.param_min_power))):
+            self.param_min_power[k].value = float(min_power_of_deferrable_loads[k])
+
         # Update def_current_state parameters for deferrable loads
         self._update_def_current_state_params(num_deferrable_loads)
+        # Initialize stress configs (used in fallback retry block outside the if-branch below)
+        inv_stress_conf = None
+        batt_stress_conf = None
+
         # Build Problem (Lazy Construction)
         if self.prob is None:
             self.logger.info("Building CVXPY problem structure...")
@@ -3191,8 +3273,6 @@ class Optimization:
             constraints = self.constraints[:]
 
             # Setup Stress Costs
-            inv_stress_conf = None
-            batt_stress_conf = None
 
             if self.optim_conf["set_use_battery"]:
                 p_batt_max = max(

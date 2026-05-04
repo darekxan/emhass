@@ -517,6 +517,39 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
                     f"Invalid values found: {non_zero_powers[non_zero_powers < min_power_k].tolist()}",
                 )
 
+    def test_perform_dayahead_forecast_optim_min_def_load_power_cache_hit(self):
+        """Min-power values must be honoured on the second call (cache hit)."""
+        # First call: build the problem with an initial min power
+        self.optim_conf["minimum_power_of_deferrable_loads"] = [500.0, 100.0]
+        self.opt = self.create_optimization()
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+
+        # Second call: change min power — the cached problem should pick up the new value
+        new_min_powers = [1500.0, 300.0]
+        self.optim_conf["minimum_power_of_deferrable_loads"] = new_min_powers
+        # Also update the Optimization object's optim_conf so perform_optimization
+        # reads the new values when min_power_of_deferrable_loads is not passed explicitly
+        self.opt.optim_conf["minimum_power_of_deferrable_loads"] = new_min_powers
+        result = self.opt.perform_dayahead_forecast_optim(
+            self.df_input_data_dayahead, self.p_pv_forecast, self.p_load_forecast
+        )
+
+        self.assertIsInstance(result, type(pd.DataFrame()))
+        num_loads = self.optim_conf["number_of_deferrable_loads"]
+        for k in range(num_loads):
+            power_column = result[f"P_deferrable{k}"]
+            non_zero_powers = power_column[~np.isclose(power_column, 0)]
+            if not non_zero_powers.empty:
+                self.assertTrue(
+                    (non_zero_powers >= new_min_powers[k]).all(),
+                    f"Cache-hit: deferrable load {k} has values below the updated min power "
+                    f"{new_min_powers[k]} W. Values: "
+                    f"{non_zero_powers[non_zero_powers < new_min_powers[k]].tolist()}",
+                )
+
     def test_perform_naive_mpc_optim(self):
         self.df_input_data_dayahead = self.prepare_forecast_data()
         # Test the battery
@@ -1394,6 +1427,39 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             self.optim_conf["nominal_power_of_deferrable_loads"][0]
             * pd.Series([0, 1, 1, 1, 1, 1, 0, 0, 0, 0], index=self.opt_res_dayahead.index),
             check_names=False,
+        )
+
+    def test_running_overhead_compresses_active_timesteps(self):
+        """Running overhead should bias the solver toward fewer, higher-power timesteps.
+
+        With minimum_power = 50% of nominal and an energy requirement that can be met
+        by either 5 timesteps at nominal or 10 timesteps at min_power, a non-zero
+        running overhead should push the solver to choose the 5-timestep solution.
+        """
+        nominal = self.optim_conf["nominal_power_of_deferrable_loads"][0]
+        min_power = nominal * 0.5
+
+        self.fcst.params["passed_data"]["load_cost_forecast"] = [1.0] * 10
+        self.optim_conf.update(
+            {
+                "minimum_power_of_deferrable_loads": [min_power],
+                # Overhead equal to nominal: each extra active timestep costs as much
+                # as drawing nominal power for that step, strongly favouring fewer steps.
+                "set_deferrable_load_running_overhead": [nominal],
+            }
+        )
+
+        self.run_penalty_test_forecast()
+
+        schedule = self.opt_res_dayahead["P_deferrable0"]
+        active_timesteps = (schedule > 0).sum()
+
+        # Energy requirement (5 timesteps × nominal) can be met exactly in 5 steps
+        # at nominal power; using more steps at min_power incurs more overhead cost.
+        self.assertLessEqual(
+            active_timesteps,
+            5,
+            f"Expected ≤5 active timesteps with high running overhead, got {active_timesteps}",
         )
 
     def test_perform_naive_mpc_optim_def_total_timestep(self):
