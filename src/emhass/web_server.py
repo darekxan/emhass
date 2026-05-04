@@ -52,6 +52,7 @@ emhass_conf: dict[str, Path] = {}
 entity_path: Path = Path()
 params_secrets: dict[str, str | float] = {}
 continual_publish_thread: list = []
+_current_mpc_task: asyncio.Task | None = None
 injection_dict: dict = {}
 emhass_version: str = "unknown"
 emhass_build_type: str = "unknown"
@@ -536,7 +537,23 @@ async def _handle_action_dispatch(
     if action_name in optim_actions:
         action_str = f" >> Performing {action_name}..."
         logger.info(action_str)
-        opt_res = await optim_actions[action_name](input_data_dict, logger)
+
+        if action_name == "naive-mpc-optim":
+            global _current_mpc_task
+            if _current_mpc_task is not None and not _current_mpc_task.done():
+                logger.info("Cancelling previous MPC optimization (superseded by new request)")
+                _current_mpc_task.cancel()
+            _current_mpc_task = asyncio.create_task(naive_mpc_optim(input_data_dict, logger))
+            try:
+                opt_res = await _current_mpc_task
+            except asyncio.CancelledError:
+                return "EMHASS >> MPC optimization cancelled by newer request\n", 409
+            finally:
+                if _current_mpc_task is not None and _current_mpc_task.done():
+                    _current_mpc_task = None
+        else:
+            opt_res = await optim_actions[action_name](input_data_dict, logger)
+
         injection_dict = get_injection_dict(opt_res)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
         return f"EMHASS >> Action {action_name} executed... \n", 201
