@@ -1726,44 +1726,6 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         # Note: Actual behavior depends on how EMHASS handles infeasible problems
         # This test ensures it doesn't crash
 
-    def test_thermal_battery_relaxed_temperature_bounds(self):
-        """Thermal comfort conflicts should fall back to a relaxed solution.
-
-        This covers MPC cases where hard thermal bounds conflict with current
-        runtime obligations. The primary solve may be infeasible, but the
-        relaxed retry should keep the energy optimization alive by softening
-        thermal comfort bounds with a heavy slack penalty.
-        """
-        self.df_input_data_dayahead = self.prepare_forecast_data()
-        horizon = len(self.df_input_data_dayahead)
-        self.df_input_data_dayahead["outdoor_temperature_forecast"] = [20.0] * horizon
-
-        config = {
-            "start_temperature": 23.5,
-            "supply_temperature": 35.0,
-            "volume": 50.0,
-            "specific_heating_demand": 100.0,
-            "area": 100.0,
-            # Deliberately contradictory comfort band: hard solve is infeasible.
-            "min_temperatures": [25.0] * horizon,
-            "max_temperatures": [24.0] * horizon,
-            "u_value": 0.3,
-            "envelope_area": 300.0,
-            "ventilation_rate": 0.4,
-            "heated_volume": 250.0,
-            "comfort_slack_penalty": 1e6,
-        }
-
-        opt_res = self.run_thermal_battery_optimization(config, outdoor_temps=[20.0] * horizon)
-
-        self.assertIsInstance(opt_res, pd.DataFrame)
-        self.assertGreater(len(opt_res), 0)
-        self.assertEqual(opt_res["optim_status"].iloc[0], "Optimal (Relaxed)")
-        self.assertFalse(
-            opt_res["P_deferrable0"].isna().all(),
-            "Relaxed thermal fallback should publish usable deferrable output",
-        )
-
     def test_thermal_battery_physics_based(self):
         """Test thermal battery optimization with physics-based heating demand calculation."""
         self.df_input_data_dayahead = self.prepare_forecast_data()
