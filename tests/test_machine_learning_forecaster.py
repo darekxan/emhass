@@ -133,6 +133,18 @@ class TestMLForecasterAsync(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsInstance(df_pred, pd.Series)
 
+    async def test_mlforecaster_predict_custom_steps(self):
+        """predict(steps=N) should return exactly N forecast points."""
+        mlf = self._get_standard_mlf()
+        await self._fit_standard_mlf(mlf)
+        custom_steps = 96
+        df_pred = await mlf.predict(
+            data_last_window=self.data,
+            steps=custom_steps,
+        )
+        self.assertIsInstance(df_pred, pd.Series)
+        self.assertEqual(len(df_pred), custom_steps)
+
     async def test_mlforecaster_tune(self):
         mlf = self._get_standard_mlf()
         await self._fit_standard_mlf(mlf)

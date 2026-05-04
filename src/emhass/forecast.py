@@ -543,9 +543,33 @@ class Forecast:
             data = data.copy().loc[self.forecast_dates]
         return data
 
+    def _normalize_passed_forecast_input(self, forecast_input: list | dict) -> list:
+        """Normalize passed list/dict forecast inputs to the active forecast horizon."""
+        if isinstance(forecast_input, dict):
+            forecast_data_df = pd.DataFrame.from_dict(forecast_input, orient="index").reset_index()
+            forecast_data_df.columns = ["time", "value"]
+            forecast_data_df["time"] = pd.to_datetime(
+                forecast_data_df["time"], format="ISO8601", utc=True
+            ).dt.tz_convert(self.time_zone)
+            forecast_data_df = (
+                forecast_data_df.resample(self.freq, on="time")
+                .aggregate({"value": "mean"})
+                .reindex(self.forecast_dates, method="nearest")
+            )
+            forecast_data_df["value"] = forecast_data_df["value"].ffill().bfill()
+            return forecast_data_df["value"].tolist()
+        return forecast_input
+
     def _get_weather_list(self) -> pd.DataFrame:
         """Helper to retrieve weather data from a passed list."""
-        data_list = self.params["passed_data"]["pv_power_forecast"]
+        data_list = self._normalize_passed_forecast_input(
+            self.params["passed_data"]["pv_power_forecast"]
+        )
+        if data_list is None:
+            self.logger.error(
+                "pv_power_forecast passed data is None; cannot build weather forecast list."
+            )
+            return None
         if (
             len(data_list) < len(self.forecast_dates)
             and self.params["passed_data"]["prediction_horizon"] is None
@@ -1485,7 +1509,9 @@ class Forecast:
 
     def _get_load_forecast_list(self) -> pd.DataFrame:
         """Helper to retrieve load data from a passed list."""
-        data_list = self.params["passed_data"]["load_power_forecast"]
+        data_list = self._normalize_passed_forecast_input(
+            self.params["passed_data"]["load_power_forecast"]
+        )
         if (
             len(data_list) < len(self.forecast_dates)
             and self.params["passed_data"]["prediction_horizon"] is None
@@ -1643,7 +1669,9 @@ class Forecast:
             df_final.loc[:, self.var_load_cost] = forecast_out
         elif method == "list":  # reading a list of values
             # Loading data from passed list
-            data_list = self.params["passed_data"]["load_cost_forecast"]
+            data_list = self._normalize_passed_forecast_input(
+                self.params["passed_data"]["load_cost_forecast"]
+            )
             # Check if the passed data has the correct length
             if (
                 len(data_list) < len(self.forecast_dates)
@@ -1720,7 +1748,9 @@ class Forecast:
             df_final.loc[:, self.var_prod_price] = forecast_out
         elif method == "list":  # reading a list of values
             # Loading data from passed list
-            data_list = self.params["passed_data"]["prod_price_forecast"]
+            data_list = self._normalize_passed_forecast_input(
+                self.params["passed_data"]["prod_price_forecast"]
+            )
             # Check if the passed data has the correct length
             if (
                 len(data_list) < len(self.forecast_dates)
