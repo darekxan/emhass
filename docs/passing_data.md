@@ -65,6 +65,8 @@ Here is the list of the other additional dictionary keys that can be passed at r
 
 - `nominal_power_of_deferrable_loads` for the nominal power for each deferrable load in Watts.
 
+- `minimum_power_of_deferrable_loads` for the minimum power for each deferrable load in Watts. When a load is on, its power will be at least this value. Defaults to 0 (no minimum). Can be updated at runtime on cached problems; see `config.md` for the note on binary-logic activation.
+
 - `operating_hours_of_each_deferrable_load` for the total number of hours that each deferrable load should operate.
   - Alteratively, you can pass `operating_timesteps_of_each_deferrable_load` to set the total number of timesteps for each deferrable load. *(better parameter to use for setting under 1 hr)* 
 
