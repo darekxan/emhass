@@ -65,7 +65,7 @@ html_theme_options = {
     "icon_links": [
         {
             "name": "GitHub",
-            "url": "https://github.com/davidusb-geek/emhass",
+            "url": "https://github.com/darekxan/emhass",
             "icon": "fa-brands fa-github",
         },
     ],

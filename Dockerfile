@@ -1,8 +1,8 @@
 ## EMHASS Docker
 ## Docker run app testing example:
-## docker build -t emhass .
-## OR docker build --build-arg TARGETARCH=amd64 -t emhass .
-## docker run --rm -it -p 5000:5000 --name emhass-container -v ./config.json:/share/config.json -v ./secrets_emhass.yaml:/app/secrets_emhass.yaml emhass
+## docker build -t ghcr.io/darekxan/emhass:local .
+## OR docker build --build-arg TARGETARCH=amd64 -t ghcr.io/darekxan/emhass:local .
+## docker run --rm -it -p 5000:5000 --name emhass-container -v ./config.json:/share/config.json -v ./secrets_emhass.yaml:/app/secrets_emhass.yaml ghcr.io/darekxan/emhass:local
 
 # armhf,amd64,armv7,aarch64
 ARG TARGETARCH
@@ -92,7 +92,7 @@ LABEL \
     io.hass.version=${BUILD_VERSION} \
     io.hass.type="addon" \
     io.hass.arch="aarch64|amd64" \
-    org.opencontainers.image.source="https://github.com/davidusb-geek/emhass" \
+    org.opencontainers.image.source="https://github.com/darekxan/emhass" \
     org.opencontainers.image.description="EMHASS python package and requirements, in Home Assistant Debian container."
 
 # Set up venv and add it to the PATH so it persists across RUN layers
