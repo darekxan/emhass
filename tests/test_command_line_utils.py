@@ -1576,6 +1576,335 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(found_temp, "Should publish predicted temperature")
         self.assertTrue(found_heat, "Should publish heating demand")
 
+    async def test_publish_dual_mode_thermal_sensors(self):
+        """
+        Test _publish_thermal_loads with dual-mode thermal battery configuration.
+        Verifies cooling demand and thermal mode sensors are published.
+        """
+        # Setup dual-mode thermal config
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "dual_mode_enabled": True,
+                    "model_type": "dual_mode",
+                }
+            }
+        ]
+        params["optim_conf"]["number_of_deferrable_loads"] = 1
+        # Setup passed_data with all thermal IDs including cooling and thermal_mode
+        runtimeparams = {
+            "custom_predicted_temperature_id": [
+                {
+                    "entity_id": "sensor.temp",
+                    "unit_of_measurement": "C",
+                    "friendly_name": "Predicted Temp",
+                }
+            ],
+            "custom_heating_demand_id": [
+                {
+                    "entity_id": "sensor.heating_demand",
+                    "unit_of_measurement": "kW",
+                    "friendly_name": "Heating Demand",
+                }
+            ],
+            "custom_thermal_balance_id": [
+                {
+                    "entity_id": "sensor.thermal_balance",
+                    "unit_of_measurement": "kWh",
+                    "friendly_name": "Thermal Balance",
+                }
+            ],
+            "custom_thermal_mode_id": [
+                {
+                    "entity_id": "sensor.thermal_mode",
+                    "unit_of_measurement": "",
+                    "friendly_name": "Thermal Mode",
+                }
+            ],
+        }
+        params["passed_data"] = runtimeparams
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "publish-data",
+            logger,
+            get_data_from_file=True,
+        )
+        # Create mock optimization results with dual-mode columns
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=1, freq="30min")
+        # Compute thermal_mode: 0=off, 1=heating, 2=cooling
+        heat_active = [0]
+        cool_active = [1]
+        thermal_mode = [h * 1 + c * 2 for h, c in zip(heat_active, cool_active)]
+        mock_df = pd.DataFrame(
+            {
+                "predicted_temp_heater0": [22.5],
+                "thermal_balance_heater0": [300.0],  # positive = cooling need
+                "heat_active0": heat_active,
+                "cool_active0": cool_active,
+                "thermal_mode_heater0": thermal_mode,
+                "P_deferrable0": [300.0],
+                "P_PV": [0.0],
+                "P_Load": [0.0],
+                "P_grid": [0.0],
+                "optim_status": ["Optimal"],
+                "unit_load_cost": [0.1],
+                "unit_prod_price": [0.05],
+            },
+            index=idx,
+        )
+        # Mock rh.post_data
+        input_data_dict["rh"].post_data = AsyncMock(return_value=True)
+        # Patch _get_closest_index to return 0
+        with patch("emhass.command_line._get_closest_index", return_value=0):
+            # Execute
+            await publish_data(input_data_dict, logger, opt_res_latest=mock_df)
+        # Verify all thermal data is published
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        found_temp = any("sensor.temp" in str(args) for args in call_args_list)
+        found_balance = any("sensor.thermal_balance" in str(args) for args in call_args_list)
+        found_mode = any("sensor.thermal_mode" in str(args) for args in call_args_list)
+        self.assertTrue(found_temp, "Should publish predicted temperature")
+        self.assertTrue(found_balance, "Should publish thermal balance")
+        self.assertTrue(found_mode, "Should publish thermal mode")
+
+    async def test_unified_thermal_sensor_functions(self):
+        """
+        Test the standalone unified thermal balance publisher functions.
+        """
+        # Import the functions directly for testing
+        from emhass.thermal_balance_publisher import (
+            prepare_custom_thermal_balance_ids,
+            update_thermal_sensor_config,
+        )
+
+        # Test prepare_custom_thermal_balance_ids
+        custom_ids = prepare_custom_thermal_balance_ids(3, prefix="test_")
+        self.assertEqual(len(custom_ids), 3, "Should create the correct number of sensor configs")
+        self.assertEqual(
+            custom_ids[0]["entity_id"],
+            "test_sensor.thermal_balance0",
+            "Entity ID should be correctly formatted",
+        )
+        self.assertEqual(custom_ids[0]["device_class"], "energy", "Device class should be energy")
+        self.assertEqual(custom_ids[0]["unit_of_measurement"], "kWh", "Default unit should be kWh")
+
+        # Test update_thermal_sensor_config
+        passed_data = {}
+        def_load_config = [
+            {"use_unified_thermal_model": True, "thermal_config": {}},
+            {"use_unified_thermal_model": True, "thermal_config": {}},
+        ]
+
+        updated_data = update_thermal_sensor_config(passed_data, def_load_config)
+        self.assertIn(
+            "custom_thermal_balance_id", updated_data, "Should add thermal balance sensors"
+        )
+        self.assertEqual(
+            len(updated_data["custom_thermal_balance_id"]),
+            2,
+            "Should create the right number of sensors",
+        )
+
+    async def test_publish_unified_thermal_data_function(self):
+        """Test the publish_unified_thermal_data function directly."""
+        from emhass.thermal_balance_publisher import publish_unified_thermal_data
+
+        # Mock RetrieveHass
+        mock_rh = Mock()
+        mock_rh.post_data = AsyncMock()
+
+        # Create test data
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=4, freq="30min")
+        thermal_balance = [-1000.0, -500.0, 200.0, 800.0]
+        temp_values = [19.0, 20.0, 22.0, 24.0]
+        solar_values = [100.0, 200.0, 400.0, 500.0]
+
+        opt_res = pd.DataFrame(
+            {
+                "thermal_balance0": thermal_balance,
+                "predicted_temp_heater0": temp_values,
+                "solar_gain_heater0": solar_values,
+            },
+            index=idx,
+        )
+
+        # Create test parameters
+        params = {
+            "passed_data": {
+                "custom_thermal_balance_id": [
+                    {
+                        "entity_id": "sensor.thermal_balance0",
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": "Thermal Balance",
+                    }
+                ],
+                "custom_predicted_temperature_id": [
+                    {
+                        "entity_id": "sensor.temp",
+                        "unit_of_measurement": "C",
+                        "friendly_name": "Temperature",
+                    }
+                ],
+                "custom_solar_gain_id": [
+                    {
+                        "entity_id": "sensor.solar_gain",
+                        "unit_of_measurement": "kWh",
+                        "friendly_name": "Solar Gain",
+                    }
+                ],
+            }
+        }
+
+        optim_conf = {
+            "number_of_deferrable_loads": 1,
+            "def_load_config": [{"use_unified_thermal_model": True, "thermal_config": {}}],
+        }
+
+        # Call the function
+        results = await publish_unified_thermal_data(
+            mock_rh, opt_res, idx, params, optim_conf, logger
+        )
+
+        # Verify the result
+        self.assertEqual(len(results), 3, "Should publish 3 sensors")
+        self.assertEqual(mock_rh.post_data.call_count, 3, "Should call post_data 3 times")
+
+        # Check what was posted
+        call_args_list = mock_rh.post_data.call_args_list
+        entities_posted = [args[0][2] for args in call_args_list]
+        self.assertIn(
+            "sensor.thermal_balance0", entities_posted, "Should publish thermal balance sensor"
+        )
+        self.assertIn("sensor.temp", entities_posted, "Should publish temperature sensor")
+        self.assertIn("sensor.solar_gain", entities_posted, "Should publish solar gain sensor")
+
+        # Check attributes for thermal balance sensor
+        for args in call_args_list:
+            if args[0][2] == "sensor.thermal_balance0" and "attributes" in args[1]:
+                attrs = args[1]["attributes"]
+                self.assertIn("mode", attrs, "Thermal balance should have mode attribute")
+                self.assertIn(
+                    "heating_demand", attrs, "Thermal balance should have heating_demand attribute"
+                )
+                self.assertIn(
+                    "cooling_demand", attrs, "Thermal balance should have cooling_demand attribute"
+                )
+
+                # First value is -1000.0 which is heating need (negative = heating)
+                self.assertEqual(
+                    attrs["mode"],
+                    "heating",
+                    "Mode should be 'heating' for negative thermal balance",
+                )
+                self.assertGreater(attrs["heating_demand"], 0, "Heating demand should be positive")
+                self.assertEqual(
+                    attrs["cooling_demand"], 0, "Cooling demand should be 0 for heating mode"
+                )
+                break
+
+    async def test_thermal_mode_calculation(self):
+        """
+        Test that thermal mode is correctly calculated from heat_active and cool_active.
+        thermal_mode should be: 0=off, 1=heating, 2=cooling.
+        """
+        # Setup dual-mode thermal config
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params["optim_conf"]["def_load_config"] = [
+            {
+                "thermal_battery": {
+                    "dual_mode_enabled": True,
+                    "model_type": "dual_mode",
+                }
+            }
+        ]
+        params["optim_conf"]["number_of_deferrable_loads"] = 1
+        # Setup passed_data
+        runtimeparams = {
+            "custom_predicted_temperature_id": [
+                {
+                    "entity_id": "sensor.temp",
+                    "unit_of_measurement": "C",
+                    "friendly_name": "Predicted Temp",
+                }
+            ],
+            "custom_thermal_mode_id": [
+                {
+                    "entity_id": "sensor.thermal_mode",
+                    "unit_of_measurement": "",
+                    "friendly_name": "Thermal Mode",
+                }
+            ],
+        }
+        params["passed_data"] = runtimeparams
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "publish-data",
+            logger,
+            get_data_from_file=True,
+        )
+        # Create mock results with different mode combinations
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=4, freq="30min")
+        # Compute thermal_mode values: 0=off, 1=heating, 2=cooling
+        heat_active = [0, 1, 0, 0]
+        cool_active = [0, 0, 1, 0]
+        thermal_mode = [h * 1 + c * 2 for h, c in zip(heat_active, cool_active)]
+        mock_df = pd.DataFrame(
+            {
+                "predicted_temp_heater0": [20.0, 21.0, 22.0, 23.0],
+                "heat_active0": heat_active,
+                "cool_active0": cool_active,
+                "thermal_mode_heater0": thermal_mode,
+                "P_deferrable0": [0.0, 1000.0, 1000.0, 0.0],
+                "P_PV": [0.0, 0.0, 0.0, 0.0],
+                "P_Load": [0.0, 0.0, 0.0, 0.0],
+                "P_grid": [0.0, 0.0, 0.0, 0.0],
+                "optim_status": ["Optimal"] * 4,
+                "unit_load_cost": [0.1] * 4,
+                "unit_prod_price": [0.05] * 4,
+            },
+            index=idx,
+        )
+        # Mock rh.post_data to capture the thermal_mode values
+        posted_data = []
+
+        async def capture_post_data(data, *args, **kwargs):
+            posted_data.append(data.values if hasattr(data, "values") else data)
+            return True
+
+        input_data_dict["rh"].post_data = capture_post_data
+        # Patch _get_closest_index
+        with patch("emhass.command_line._get_closest_index", return_value=0):
+            # Execute
+            await publish_data(input_data_dict, logger, opt_res_latest=mock_df)
+        # Verify thermal mode values were published
+        # Mode should be: [0, 1, 2, 0] based on heat_active and cool_active
+        # Find the thermal_mode data in posted_data
+        thermal_mode_found = False
+        for posted in posted_data:
+            if hasattr(posted, "tolist"):
+                values = posted.tolist()
+            else:
+                values = posted
+            # Check if this is thermal mode data (should have values [0, 1, 2, 0])
+            if isinstance(values, list) and len(values) == 4:
+                expected = [0, 1, 2, 0]
+                if values == expected:
+                    thermal_mode_found = True
+                    break
+        self.assertTrue(
+            thermal_mode_found,
+            f"Thermal mode calculation incorrect. Expected [0, 1, 2, 0], got thermal mode data: {posted_data}",
+        )
+
     async def test_regressor_preparation_errors(self):
         """
         Test logger error paths in _prepare_regressor_fit (missing CSV, missing columns).

@@ -1,0 +1,151 @@
+# Example configuration for EMHASS unified thermal model
+# This configuration demonstrates how to set up a heat pump system 
+# that can operate in both heating and cooling modes based on actual demand.
+
+# Home Assistant configuration for EMHASS
+rest_command:
+  emhass_thermal_model_optim:
+    url: http://localhost:5000/action/naive-mpc-optim
+    method: post
+    timeout: 300
+    headers:
+      content-type: application/json
+    payload: >
+      {
+        "prediction_horizon": 24,
+        
+        "load_cost_forecast": {{ (state_attr('sensor.electricity_price_forecast', 'forecasts') | map(attribute='currency_per_kWh') | list)[:24] | tojson }},
+        
+        "load_power_forecast": {{ (state_attr('sensor.load_forecast', 'forecast') | map(attribute='value') | list)[:24] | tojson }},
+        
+        "outdoor_temperature_forecast": {{ (state_attr("sensor.weather_hourly", "forecast") | map(attribute="temperature") | list)[:24] | tojson }},
+        
+        "ghi_forecast": {{ (state_attr("sensor.weather_hourly", "forecast") | map(attribute="ghi") | list)[:24] | tojson }},
+        
+        "def_load_config": [
+          {
+            "thermal_config": {
+              "thermal_efficiency": 5.0,          // Coefficient for how effectively the heat pump changes indoor temperature
+              "heat_loss_coefficient": 0.1,       // Rate at which building loses/gains heat to/from environment
+              "thermal_inertia": 1.0,             // Building's thermal mass (hours of delay)
+              "start_temperature": {{ states('sensor.room_temperature') | float(20.0) }},
+              
+              // Single target temperature (can be an array for variable setpoints)
+              "target_temperature": 22.0,
+              
+              // Alternative approach with temperature bounds
+              // "min_temperatures": [20.0, 20.0, 20.0, 20.0, 19.0, 19.0, 19.0,  // Night
+              //                      20.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0,   // Day
+              //                      21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0,   // Evening
+              //                      20.0, 20.0, 20.0],                          // Night again
+              // "max_temperatures": [22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 22.0,  // Night
+              //                      24.0, 24.0, 24.0, 25.0, 25.0, 25.0, 25.0,   // Day
+              //                      24.0, 24.0, 24.0, 24.0, 23.0, 23.0, 23.0,   // Evening
+              //                      22.0, 22.0, 22.0],                          // Night again
+              
+              // Heating mode parameters
+              "heat_cop_params": {
+                "supply_temperature": 35.0,       // For underfloor: 30-40°C, for radiators: 45-55°C
+                "carnot_efficiency": 0.4          // Real-world efficiency vs. theoretical maximum (0.35-0.45)
+              },
+              
+              // Cooling mode parameters
+              "cool_cop_params": {
+                "supply_temperature": 12.0,       // For cooling: 7-18°C depending on system type
+                "carnot_efficiency": 0.45         // Cooling is often slightly more efficient
+              },
+              
+              // Optional window parameters for solar gains
+              "window_area": 15.0,                // Total window area in m²
+              "shgc": 0.6,                        // Solar Heat Gain Coefficient (0.5-0.8)
+              
+              // Capacity limits
+              "max_heating_capacity": 4000,       // Maximum heating power in Watts
+              "max_cooling_capacity": 3500,       // Maximum cooling power in Watts
+              
+              // Building physics parameters
+              "u_value": 0.5,                     // Overall heat transfer coefficient (W/m²K)
+              "envelope_area": 350.0,             // Total envelope surface area (m²)
+              "ventilation_rate": 0.5,            // Air changes per hour (ACH)
+              "heated_volume": 280.0              // Total volume of heated/cooled space (m³)
+            }
+          }
+        ]
+      }
+
+# EMHASS publish data configuration
+# This defines which sensor data will be published to Home Assistant
+automation:
+  - alias: EMHASS - Publish Thermal Data
+    trigger:
+      - platform: time_pattern
+        minutes: /10
+    action:
+      - service: rest_command.emhass_publish_data
+        data:
+          payload: >
+            {
+              "def_load_config": [
+                {
+                  "thermal_config": {}
+                }
+              ]
+            }
+
+# Home Assistant sensor templates to interpret thermal balance data
+template:
+  - sensor:
+      - name: "HVAC Heat Demand"
+        icon: mdi:radiator
+        unit_of_measurement: "kWh"
+        state: >
+          {% set balance = states('sensor.thermal_balance0') | float(0) %}
+          {% if balance > 0 %}
+            {{ balance | round(2) }}
+          {% else %}
+            0
+          {% endif %}
+        
+      - name: "HVAC Cool Demand"
+        icon: mdi:snowflake
+        unit_of_measurement: "kWh"
+        state: >
+          {% set balance = states('sensor.thermal_balance0') | float(0) %}
+          {% if balance < 0 %}
+            {{ (-balance) | round(2) }}
+          {% else %}
+            0
+          {% endif %}
+            
+      - name: "HVAC Mode"
+        icon: mdi:hvac
+        state: >
+          {% set balance = states('sensor.thermal_balance0') | float(0) %}
+          {% if balance > 0.2 %}
+            heating
+          {% elif balance < -0.2 %}
+            cooling
+          {% else %}
+            idle
+          {% endif %}
+          
+# Example dashboard configuration for visualizing thermal balance
+  - name: "Thermal Balance Card"
+    type: custom:mini-graph-card
+    entities:
+      - entity: sensor.thermal_balance0
+        name: "Thermal Balance"
+    hours_to_show: 24
+    points_per_hour: 4
+    line_width: 2
+    color_thresholds:
+      - value: 0
+        color: "#3498db"  # Blue for cooling (negative values)
+      - value: 0.01
+        color: "#e74c3c"  # Red for heating (positive values)
+    show:
+      labels: true
+      points: false
+      fill: true
+    animate: true
+    hour24: true

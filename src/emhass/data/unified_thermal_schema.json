@@ -1,0 +1,142 @@
+{
+  "thermal_config": {
+    "type": "object",
+    "description": "Configuration for the unified thermal balance model.",
+    "properties": {
+      "thermal_efficiency": {
+        "type": "number",
+        "description": "Thermal input efficiency coefficient (how effectively the heat pump changes indoor temperature). Equivalent to the old 'heating_rate' parameter.",
+        "default": 5.0
+      },
+      "heat_loss_coefficient": {
+        "type": "number",
+        "description": "Rate at which building loses/gains heat to/from environment. Equivalent to the old 'cooling_constant' parameter.",
+        "default": 0.1
+      },
+      "thermal_inertia": {
+        "type": "number",
+        "description": "System response lag in hours. Time delay between power application and temperature effect.",
+        "default": 0.0
+      },
+      "start_temperature": {
+        "type": "number",
+        "description": "Starting indoor temperature in °C.",
+        "default": 20.0
+      },
+      "target_temperature": {
+        "oneOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          }
+        ],
+        "description": "Target temperature setpoint(s) to maintain. Can be a single value or an array for variable setpoints over time."
+      },
+      "min_temperatures": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "description": "Minimum allowed temperatures per timestep. Defines the lower comfort boundary."
+      },
+      "max_temperatures": {
+        "type": "array",
+        "items": {
+          "type": "number"
+        },
+        "description": "Maximum allowed temperatures per timestep. Defines the upper comfort boundary."
+      },
+      "heat_cop_params": {
+        "type": "object",
+        "description": "Parameters for heating COP calculation.",
+        "properties": {
+          "supply_temperature": {
+            "type": "number",
+            "description": "Heat pump supply temperature for heating mode in °C. Typical values: 30-50°C for underfloor heating, 45-55°C for radiators.",
+            "default": 35.0
+          },
+          "carnot_efficiency": {
+            "type": "number",
+            "description": "Carnot efficiency factor for heating (0.35-0.45). Represents real-world efficiency as fraction of theoretical maximum.",
+            "default": 0.4
+          }
+        }
+      },
+      "cool_cop_params": {
+        "type": "object",
+        "description": "Parameters for cooling COP calculation.",
+        "properties": {
+          "supply_temperature": {
+            "type": "number",
+            "description": "Heat pump supply temperature for cooling mode in °C. Typical values: 7-18°C depending on system type.",
+            "default": 12.0
+          },
+          "carnot_efficiency": {
+            "type": "number",
+            "description": "Carnot efficiency factor for cooling (0.35-0.5). Represents real-world efficiency as fraction of theoretical maximum.",
+            "default": 0.45
+          }
+        }
+      },
+      "max_heating_capacity": {
+        "type": "number",
+        "description": "Maximum heating power in Watts.",
+        "default": 5000
+      },
+      "max_cooling_capacity": {
+        "type": "number",
+        "description": "Maximum cooling power in Watts.",
+        "default": 4000
+      },
+      "u_value": {
+        "type": "number",
+        "description": "Overall heat transfer coefficient (U-value) in W/(m²·K). Measures the insulation properties of the building envelope.",
+        "default": 0.5
+      },
+      "envelope_area": {
+        "type": "number",
+        "description": "Total building envelope surface area (walls + roof + floor + windows) in m².",
+        "default": 350.0
+      },
+      "ventilation_rate": {
+        "type": "number",
+        "description": "Air changes per hour (ACH). Rate at which indoor air is replaced with outdoor air.",
+        "default": 0.5
+      },
+      "heated_volume": {
+        "type": "number", 
+        "description": "Total volume of heated/cooled space in m³.",
+        "default": 250.0
+      },
+      "window_area": {
+        "type": "number",
+        "description": "Total window area in m². Used for solar gain calculations.",
+        "default": null
+      },
+      "shgc": {
+        "type": "number",
+        "description": "Solar Heat Gain Coefficient (0-1). Fraction of solar radiation that becomes heat inside the building.",
+        "default": 0.6
+      },
+      "internal_gains_factor": {
+        "type": "number",
+        "description": "Factor (0-1) representing what fraction of electrical load becomes useful internal heat gains.",
+        "default": 0.0
+      }
+    },
+    "required": [
+      "thermal_efficiency",
+      "heat_loss_coefficient",
+      "start_temperature",
+      "u_value",
+      "envelope_area",
+      "ventilation_rate",
+      "heated_volume"
+    ]
+  }
+}
