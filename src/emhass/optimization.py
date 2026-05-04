@@ -2296,9 +2296,17 @@ class Optimization:
             p_heat = cp.Variable(required_len, nonneg=True, name=f"p_heat_{k}")
             p_cool = cp.Variable(required_len, nonneg=True, name=f"p_cool_{k}")
 
-            # Create binary mode indicators
-            heat_active = cp.Variable(required_len, boolean=True, name=f"heat_active_{k}")
-            cool_active = cp.Variable(required_len, boolean=True, name=f"cool_active_{k}")
+            # Create mode indicators. The relaxed retry keeps these continuous so
+            # thermal fallback can become a real LP instead of rebuilding another MIP.
+            relax_mode_binaries = getattr(self, "_relax_thermal_mode_binaries", False)
+            if relax_mode_binaries:
+                heat_active = cp.Variable(required_len, nonneg=True, name=f"heat_active_{k}")
+                cool_active = cp.Variable(required_len, nonneg=True, name=f"cool_active_{k}")
+                constraints.append(heat_active <= 1)
+                constraints.append(cool_active <= 1)
+            else:
+                heat_active = cp.Variable(required_len, boolean=True, name=f"heat_active_{k}")
+                cool_active = cp.Variable(required_len, boolean=True, name=f"cool_active_{k}")
 
             # Store in class variables for later access
             self.vars[f"p_heat_{k}"] = p_heat
@@ -2578,8 +2586,16 @@ class Optimization:
                 )
 
         # Min/Max Temperature Constraints using parameters
+        relax_comfort_bounds = getattr(self, "_relax_thermal_comfort_bounds", False)
+        comfort_penalty = 0
+        comfort_penalty_weight = float(hc.get("comfort_slack_penalty", 1e6))
         if min_temps_param is not None:
-            constraints.append(predicted_temp_thermal[1:] >= min_temps_param[1:])
+            if relax_comfort_bounds:
+                min_slack = cp.Variable(required_len - 1, nonneg=True, name=f"temp_min_slack_{k}")
+                constraints.append(predicted_temp_thermal[1:] >= min_temps_param[1:] - min_slack)
+                comfort_penalty -= comfort_penalty_weight * cp.sum(min_slack)
+            else:
+                constraints.append(predicted_temp_thermal[1:] >= min_temps_param[1:])
         else:
             valid_indices = [
                 i
@@ -2588,10 +2604,24 @@ class Optimization:
             ]
             if valid_indices:
                 limit_vals = np.array([min_temperatures_list[i] for i in valid_indices])
-                constraints.append(predicted_temp_thermal[valid_indices] >= limit_vals)
+                if relax_comfort_bounds:
+                    min_slack = cp.Variable(
+                        len(valid_indices), nonneg=True, name=f"temp_min_slack_{k}"
+                    )
+                    constraints.append(
+                        predicted_temp_thermal[valid_indices] >= limit_vals - min_slack
+                    )
+                    comfort_penalty -= comfort_penalty_weight * cp.sum(min_slack)
+                else:
+                    constraints.append(predicted_temp_thermal[valid_indices] >= limit_vals)
 
         if max_temps_param is not None:
-            constraints.append(predicted_temp_thermal[1:] <= max_temps_param[1:])
+            if relax_comfort_bounds:
+                max_slack = cp.Variable(required_len - 1, nonneg=True, name=f"temp_max_slack_{k}")
+                constraints.append(predicted_temp_thermal[1:] <= max_temps_param[1:] + max_slack)
+                comfort_penalty -= comfort_penalty_weight * cp.sum(max_slack)
+            else:
+                constraints.append(predicted_temp_thermal[1:] <= max_temps_param[1:])
         else:
             valid_indices = [
                 i
@@ -2600,7 +2630,16 @@ class Optimization:
             ]
             if valid_indices:
                 limit_vals = np.array([max_temperatures_list[i] for i in valid_indices])
-                constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
+                if relax_comfort_bounds:
+                    max_slack = cp.Variable(
+                        len(valid_indices), nonneg=True, name=f"temp_max_slack_{k}"
+                    )
+                    constraints.append(
+                        predicted_temp_thermal[valid_indices] <= limit_vals + max_slack
+                    )
+                    comfort_penalty -= comfort_penalty_weight * cp.sum(max_slack)
+                else:
+                    constraints.append(predicted_temp_thermal[valid_indices] <= limit_vals)
 
         # Return demand array for result building.
         # For dual-mode loads the signed thermal_balance is returned; for single-mode
@@ -2614,7 +2653,7 @@ class Optimization:
         solar_gains_arr = (
             self.param_thermal[k]["solar_gains"].value if k in self.param_thermal else solar_gains
         )
-        return predicted_temp_thermal, demand_arr, q_input, solar_gains_arr
+        return predicted_temp_thermal, demand_arr, q_input, solar_gains_arr, comfort_penalty
 
     def _add_deferrable_load_constraints(
         self,
@@ -2718,12 +2757,14 @@ class Optimization:
                 and len(self.optim_conf["def_load_config"]) > k
                 and "thermal_battery" in self.optim_conf["def_load_config"][k]
             ):
-                pred_temp, heat_demand, q_input_var, solar_gain_arr = (
+                pred_temp, heat_demand, q_input_var, solar_gain_arr, penalty_term = (
                     self._add_thermal_battery_constraints(constraints, k, data_opt, p_load)
                 )
                 predicted_temps[k] = pred_temp
                 heating_demands[k] = heat_demand
                 solar_gains[k] = solar_gain_arr
+                if penalty_term is not None:
+                    penalty_terms_total += penalty_term
                 if q_input_var is not None:
                     q_inputs[k] = q_input_var
 
@@ -4176,11 +4217,15 @@ class Optimization:
             original_single_const = copy.deepcopy(
                 self.optim_conf.get("set_deferrable_load_single_constant", [])
             )
+            original_relax_comfort = getattr(self, "_relax_thermal_comfort_bounds", False)
+            original_relax_modes = getattr(self, "_relax_thermal_mode_binaries", False)
 
             # Relax Configuration: Disable Binary Logic
             n_def = self.optim_conf["number_of_deferrable_loads"]
             self.optim_conf["treat_deferrable_load_as_semi_cont"] = [False] * n_def
             self.optim_conf["set_deferrable_load_single_constant"] = [False] * n_def
+            self._relax_thermal_comfort_bounds = True
+            self._relax_thermal_mode_binaries = True
 
             # Re-build Constraints (Clean Slate)
             constraints_relaxed = self.constraints[:]  # Start with base bound constraints
@@ -4248,6 +4293,8 @@ class Optimization:
             # 5. Restore Configuration
             self.optim_conf["treat_deferrable_load_as_semi_cont"] = original_semi_cont
             self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
+            self._relax_thermal_comfort_bounds = original_relax_comfort
+            self._relax_thermal_mode_binaries = original_relax_modes
 
         # Extract shadow prices
         if not self.optim_conf.get("skip_shadow_price_extraction", False):
