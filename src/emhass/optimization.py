@@ -215,6 +215,15 @@ class Optimization:
             timesteps_active.value = 0.0
             self.param_timesteps_active.append(timesteps_active)
 
+        # Obligation Mask Parameters for min_runtime carry-over across MPC horizons
+        # obligation_mask[t] = 1 forces the load to be on at timestep t
+        # Used when def_load_steps_fulfilled > 0 and min_runtime is not yet satisfied
+        self.param_obligation_masks = []
+        for k in range(num_def_loads):
+            mask = cp.Parameter(n, nonneg=True, name=f"obligation_mask_{k}")
+            mask.value = np.zeros(n)  # Default: no obligation
+            self.param_obligation_masks.append(mask)
+
         # Deferrable load current state parameters (for startup detection)
         # Allows updating def_current_state without rebuilding constraints.
         # IMPORTANT: Values MUST be exactly 0.0 or 1.0 (binary indicator).
@@ -420,10 +429,21 @@ class Optimization:
         for unexpected values that would silently weaken MIP constraints.
         Missing entries default to off (0.0).
         """
+        steps_fulfilled_conf_early = self.optim_conf.get("def_load_steps_fulfilled", None)
         if "def_current_state" not in self.optim_conf:
             # Reset all to 0.0 to avoid stale values from previous solves
             for k in range(min(num_def_loads, len(self.param_def_current_state))):
                 self.param_def_current_state[k].value = 0.0
+                # If steps_fulfilled > 0, the load was running — mark as on
+                if steps_fulfilled_conf_early is not None and k < len(steps_fulfilled_conf_early):
+                    if int(steps_fulfilled_conf_early[k]) > 0:
+                        self.param_def_current_state[k].value = 1.0
+            self._def_load_steps_fulfilled = [
+                int(steps_fulfilled_conf_early[k])
+                if steps_fulfilled_conf_early and k < len(steps_fulfilled_conf_early)
+                else 0
+                for k in range(num_def_loads)
+            ]
             return
 
         def_state_conf = self.optim_conf["def_current_state"]
@@ -438,6 +458,8 @@ class Optimization:
                 n_conf_states,
             )
 
+        steps_fulfilled_conf = self.optim_conf.get("def_load_steps_fulfilled", None)
+
         for k in range(num_def_loads):
             state = def_state_conf[k] if k < n_conf_states else False
             # Validate binary: accept bool and numeric 0/1, reject everything else
@@ -450,6 +472,18 @@ class Optimization:
                     f"Invalid def_current_state value at index {k}: {state!r}. "
                     "Expected one of {{True, False, 0, 1, 0.0, 1.0}}."
                 )
+            # If steps_fulfilled > 0, the load was running — override def_current_state to on
+            if steps_fulfilled_conf is not None and k < len(steps_fulfilled_conf):
+                steps = int(steps_fulfilled_conf[k])
+                if steps > 0:
+                    self.param_def_current_state[k].value = 1.0
+
+        self._def_load_steps_fulfilled = [
+            int(steps_fulfilled_conf[k])
+            if steps_fulfilled_conf and k < len(steps_fulfilled_conf)
+            else 0
+            for k in range(num_def_loads)
+        ]
 
     def update_thermal_start_temps(self, optim_conf: dict) -> None:
         """
@@ -1725,6 +1759,12 @@ class Optimization:
                             cool_active[t] - cool_active[t - 1] <= cool_active[t + i]
                         )
 
+            # Obligation: force load on for remaining steps from previous horizon
+            # (heat_active + cool_active >= mask[t] together with mutual exclusivity
+            # forces exactly one mode active at each obligated timestep)
+            if k < len(self.param_obligation_masks):
+                constraints.append(heat_active + cool_active >= self.param_obligation_masks[k])
+
             # Transition cooldown: per-step constraints (not a SUM) so that multiple
             # consecutive steps in one mode don't make the constraint infeasible.
             if transition_cooldown > 0:
@@ -2306,6 +2346,12 @@ class Optimization:
                         constraints.append(
                             cool_active[t] - cool_active[t - 1] <= cool_active[t + i]
                         )
+
+            # Obligation: force load on for remaining steps from previous horizon
+            # (heat_active + cool_active >= mask[t] together with mutual exclusivity
+            # forces exactly one mode active at each obligated timestep)
+            if k < len(self.param_obligation_masks):
+                constraints.append(heat_active + cool_active >= self.param_obligation_masks[k])
 
             # Transition cooldown: prevent immediate switching between modes.
             # Use per-step constraints (not a SUM) so that multiple consecutive steps
@@ -3300,6 +3346,39 @@ class Optimization:
                 window_mask[:] = 1.0
 
             self.param_window_masks[k].value = window_mask
+
+        # Update Obligation Mask Parameters for min_runtime carry-over across MPC horizons
+        # Read steps_fulfilled directly from optim_conf so the mask is correct on the
+        # first call (self._def_load_steps_fulfilled is set later by
+        # _update_def_current_state_params, so using getattr would yield stale zeros).
+        # The obligation only applies when the load is currently mid-run; a fresh
+        # start (def_current_state falsy and no steps fulfilled) must produce zero
+        # obligation, otherwise every horizon forces the load on for min_runtime
+        # steps even when the deadband would stay satisfied by doing nothing.
+        steps_fulfilled_conf = self.optim_conf.get("def_load_steps_fulfilled", None)
+        steps_fulfilled_list = [
+            int(steps_fulfilled_conf[k])
+            if steps_fulfilled_conf and k < len(steps_fulfilled_conf)
+            else 0
+            for k in range(num_deferrable_loads)
+        ]
+        def_state_conf = self.optim_conf.get("def_current_state", [False] * num_deferrable_loads)
+        def_load_config = self.optim_conf.get("def_load_config", []) or []
+        for k in range(min(num_deferrable_loads, len(self.param_obligation_masks))):
+            steps_fulfilled = steps_fulfilled_list[k] if k < len(steps_fulfilled_list) else 0
+            raw_state = def_state_conf[k] if k < len(def_state_conf) else False
+            currently_on = bool(raw_state) or steps_fulfilled > 0
+            min_runtime = 1
+            if k < len(def_load_config) and def_load_config[k]:
+                hc = def_load_config[k]
+                # Unwrap nested thermal_config / thermal_battery structure
+                thermal_cfg = hc.get("thermal_config", hc.get("thermal_battery", hc))
+                if thermal_cfg.get("dual_mode_enabled", False):
+                    min_runtime = thermal_cfg.get("min_runtime", 1)
+            remaining = max(0, min_runtime - steps_fulfilled) if currently_on else 0
+            obligation = np.zeros(n)
+            obligation[: min(remaining, n)] = 1.0
+            self.param_obligation_masks[k].value = obligation
 
         # Update Thermal Parameters for warm-starting
         # This updates all thermal parameters (outdoor_temp, heating_demand, COPs, etc.)

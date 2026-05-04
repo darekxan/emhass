@@ -195,6 +195,20 @@ When `thermal_inertia_time_constant > 0`, an additional sensor is published:
 
 This sensor shows the effective heat delivery after accounting for the system's thermal lag. Compare it with `P_deferrable{k}` to see the smoothing effect.
 
+### Cross-horizon min_runtime carry-over
+
+When running in MPC mode with `min_runtime > 1`, use `def_load_steps_fulfilled` to carry the remaining run obligation across optimization calls:
+
+```json
+{
+  "def_load_steps_fulfilled": [2, 0]
+}
+```
+
+Set this to the number of consecutive timesteps the load has already been running. The optimizer will force the load to remain active for `min_runtime - steps_fulfilled` more timesteps at the start of the new horizon. Set to `0` (or omit) when the load was off or the minimum runtime was already satisfied.
+
+This prevents the load from turning off prematurely mid-cycle when the horizon boundary clips the `min_runtime` enforcement window.
+
 ## Example configurations
 
 ### Example 1: Modern home with underfloor heating, solar and internal gains
