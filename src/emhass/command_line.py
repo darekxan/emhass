@@ -2088,6 +2088,13 @@ async def _publish_standard_forecasts(
     """Publish PV, Load, Curtailment, and Hybrid Inverter data."""
     cols = []
     # Load Forecast
+    if "P_Load" not in opt_res_latest.columns:
+        ctx.logger.warning(
+            "P_Load column not found in optimization results "
+            "(optimization may have been infeasible). "
+            "Skipping standard forecast publishing."
+        )
+        return cols
     custom_load = ctx.params["passed_data"]["custom_load_forecast_id"]
     await ctx.rh.post_data(
         opt_res_latest["P_Load"],
@@ -2366,7 +2373,31 @@ async def _publish_battery_data(ctx: PublishContext, opt_res_latest: pd.DataFram
 async def _publish_grid_and_costs(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
     """Publish Grid Power, Costs, and Optimization Status."""
     cols = []
-    # Grid
+    # Optim Status — always publish regardless of whether optimization was feasible
+    custom_status = ctx.params["passed_data"]["custom_optim_status_id"]
+    if "optim_status" not in opt_res_latest:
+        opt_res_latest["optim_status"] = "Optimal"
+        ctx.logger.warning("no optim_status in opt_res_latest")
+    status_val = opt_res_latest["optim_status"]
+    await ctx.rh.post_data(
+        status_val,
+        ctx.idx,
+        custom_status["entity_id"],
+        "",
+        "",
+        custom_status["friendly_name"],
+        type_var="optim_status",
+        **ctx.common_kwargs,
+    )
+    cols.append("optim_status")
+    # Grid — skip if optimization was infeasible (column absent)
+    if "P_grid" not in opt_res_latest.columns:
+        ctx.logger.warning(
+            "P_grid column not found in optimization results "
+            "(optimization may have been infeasible). "
+            "Skipping grid power and cost publishing."
+        )
+        return cols
     custom_grid = ctx.params["passed_data"]["custom_grid_forecast_id"]
     await ctx.rh.post_data(
         opt_res_latest["P_grid"],
@@ -2392,28 +2423,14 @@ async def _publish_grid_and_costs(ctx: PublishContext, opt_res_latest: pd.DataFr
         type_var="cost_fun",
         **ctx.common_kwargs,
     )
-    # Optim Status
-    custom_status = ctx.params["passed_data"]["custom_optim_status_id"]
-    if "optim_status" not in opt_res_latest:
-        opt_res_latest["optim_status"] = "Optimal"
-        ctx.logger.warning("no optim_status in opt_res_latest")
-    status_val = opt_res_latest["optim_status"]
-    await ctx.rh.post_data(
-        status_val,
-        ctx.idx,
-        custom_status["entity_id"],
-        "",
-        "",
-        custom_status["friendly_name"],
-        type_var="optim_status",
-        **ctx.common_kwargs,
-    )
-    cols.append("optim_status")
     # Unit Costs
     for key, var_name in [
         ("custom_unit_load_cost_id", "unit_load_cost"),
         ("custom_unit_prod_price_id", "unit_prod_price"),
     ]:
+        if var_name not in opt_res_latest.columns:
+            ctx.logger.warning(f"{var_name} column not found in optimization results. Skipping.")
+            continue
         custom_id = ctx.params["passed_data"][key]
         await ctx.rh.post_data(
             opt_res_latest[var_name],
