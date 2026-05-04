@@ -1905,6 +1905,54 @@ class TestCommandLineAsyncUtils(unittest.IsolatedAsyncioTestCase):
             f"Thermal mode calculation incorrect. Expected [0, 1, 2, 0], got thermal mode data: {posted_data}",
         )
 
+    async def test_publish_data_infeasible_optimization(self):
+        """
+        Regression test: publish_data must not raise KeyError when optimization was
+        infeasible and the results DataFrame contains only 'optim_status' (no P_grid,
+        P_Load, P_batt, P_deferrable*, unit_load_cost, unit_prod_price columns).
+
+        Expected behaviour:
+        - No exception is raised.
+        - post_data is called exactly once (for optim_status).
+        - The published optim_status value is 'Infeasible'.
+        """
+        params = await TestCommandLineAsyncUtils.get_test_params()
+        params_json = orjson.dumps(params).decode("utf-8")
+        input_data_dict = await set_input_data_dict(
+            emhass_conf,
+            "profit",
+            params_json,
+            None,
+            "publish-data",
+            logger,
+            get_data_from_file=True,
+        )
+        # Simulate the DataFrame returned by optimization.py when the solver
+        # reports infeasible/unbounded: only the optim_status column is set.
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Europe/Paris"), periods=1, freq="30min")
+        infeasible_df = pd.DataFrame({"optim_status": ["Infeasible"]}, index=idx)
+
+        input_data_dict["rh"].post_data = AsyncMock(return_value=True)
+
+        with patch("emhass.command_line._get_closest_index", return_value=0):
+            # Must not raise KeyError: 'P_grid'
+            await publish_data(input_data_dict, logger, opt_res_latest=infeasible_df)
+
+        call_args_list = input_data_dict["rh"].post_data.call_args_list
+        # Only optim_status should have been posted
+        self.assertEqual(
+            len(call_args_list),
+            1,
+            f"Expected exactly 1 post_data call (optim_status), got {len(call_args_list)}",
+        )
+        # Verify the posted value is the infeasible status string
+        posted_data = call_args_list[0].args[0]
+        self.assertEqual(
+            posted_data.iloc[0],
+            "Infeasible",
+            f"Expected optim_status='Infeasible', got {posted_data.iloc[0]!r}",
+        )
+
     async def test_regressor_preparation_errors(self):
         """
         Test logger error paths in _prepare_regressor_fit (missing CSV, missing columns).
