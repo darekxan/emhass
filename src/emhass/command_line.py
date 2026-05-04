@@ -2456,6 +2456,21 @@ async def _publish_grid_and_costs(ctx: PublishContext, opt_res_latest: pd.DataFr
             **ctx.common_kwargs,
         )
         cols.append(var_name)
+
+    # Shadow Price
+    if "shadow_price" in opt_res_latest.columns:
+        await ctx.rh.post_data(
+            opt_res_latest["shadow_price"],
+            ctx.idx,
+            "sensor.shadow_price",
+            "monetary",
+            "PLN/kWh",
+            "Shadow Price",
+            type_var="shadow_price",
+            **ctx.common_kwargs,
+        )
+        cols.append("shadow_price")
+
     return cols
 
 
