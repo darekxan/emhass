@@ -1483,7 +1483,6 @@ async def naive_mpc_optim(
 
     """
     logger.info("Performing naive MPC optimization")
-    logger.info("EMHASS hotpatch active: custom ghi_forecast MPC support enabled")
     # Prepare forecast data with costs, prices, outdoor temp, and GHI (with resolution warning)
     df_input_data_dayahead = prepare_forecast_and_weather_data(
         input_data_dict, logger, warn_on_resolution=True
@@ -1506,6 +1505,7 @@ async def naive_mpc_optim(
     def_end_timestep = input_data_dict["params"]["optim_conf"][
         "end_timesteps_of_each_deferrable_load"
     ]
+    soc_sweep_targets = input_data_dict["params"]["passed_data"].get("soc_sweep_targets", None)
     opt_res_naive_mpc = await asyncio.to_thread(
         input_data_dict["opt"].perform_naive_mpc_optim,
         df_input_data_dayahead,
@@ -1518,7 +1518,15 @@ async def naive_mpc_optim(
         def_total_timestep,
         def_start_timestep,
         def_end_timestep,
+        soc_sweep_targets,
     )
+    # Save SOC sweep results to JSON for publish_data
+    sweep_results = getattr(input_data_dict["opt"], "soc_sweep_results", None)
+    if sweep_results:
+        sweep_path = input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
+        with open(sweep_path, "wb") as f:
+            f.write(orjson.dumps(sweep_results))
+        logger.info(f"Saved SOC sweep results ({len(sweep_results)} targets) to {sweep_path}")
     # Save CSV file for publish_data
     if save_data_to_file:
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1542,6 +1550,23 @@ async def naive_mpc_optim(
     ].get("entity_save", False):
         # Trigger the publish function, save entity data and not post to HA
         await publish_data(input_data_dict, logger, entity_save=True, dont_post=True)
+    else:
+        # Publish EV cost curve directly when standard publish_data is not triggered
+        sweep_path = input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
+        if sweep_path.exists():
+            publish_prefix = params["passed_data"].get("publish_prefix", "")
+            ctx = PublishContext(
+                input_data_dict=input_data_dict,
+                params=params,
+                idx=0,
+                common_kwargs={
+                    "publish_prefix": publish_prefix,
+                    "save_entities": False,
+                    "dont_post": False,
+                },
+                logger=logger,
+            )
+            await _publish_ev_cost_curve(ctx)
 
     return opt_res_naive_mpc
 
@@ -2136,32 +2161,42 @@ async def _publish_standard_forecasts(
         cols.append("P_PV")
     # Curtailment
     if ctx.plant_conf["compute_curtailment"]:
-        custom_curt = ctx.params["passed_data"]["custom_pv_curtailment_id"]
-        await ctx.rh.post_data(
-            opt_res_latest["P_PV_curtailment"],
-            ctx.idx,
-            custom_curt["entity_id"],
-            "power",
-            custom_curt["unit_of_measurement"],
-            custom_curt["friendly_name"],
-            type_var="power",
-            **ctx.common_kwargs,
-        )
-        cols.append("P_PV_curtailment")
+        if "P_PV_curtailment" in opt_res_latest.columns:
+            custom_curt = ctx.params["passed_data"]["custom_pv_curtailment_id"]
+            await ctx.rh.post_data(
+                opt_res_latest["P_PV_curtailment"],
+                ctx.idx,
+                custom_curt["entity_id"],
+                "power",
+                custom_curt["unit_of_measurement"],
+                custom_curt["friendly_name"],
+                type_var="power",
+                **ctx.common_kwargs,
+            )
+            cols.append("P_PV_curtailment")
+        else:
+            ctx.logger.warning(
+                "P_PV_curtailment column not found. Skipping curtailment publishing."
+            )
     # Hybrid Inverter
     if ctx.plant_conf["inverter_is_hybrid"]:
-        custom_inv = ctx.params["passed_data"]["custom_hybrid_inverter_id"]
-        await ctx.rh.post_data(
-            opt_res_latest["P_hybrid_inverter"],
-            ctx.idx,
-            custom_inv["entity_id"],
-            "power",
-            custom_inv["unit_of_measurement"],
-            custom_inv["friendly_name"],
-            type_var="power",
-            **ctx.common_kwargs,
-        )
-        cols.append("P_hybrid_inverter")
+        if "P_hybrid_inverter" in opt_res_latest.columns:
+            custom_inv = ctx.params["passed_data"]["custom_hybrid_inverter_id"]
+            await ctx.rh.post_data(
+                opt_res_latest["P_hybrid_inverter"],
+                ctx.idx,
+                custom_inv["entity_id"],
+                "power",
+                custom_inv["unit_of_measurement"],
+                custom_inv["friendly_name"],
+                type_var="power",
+                **ctx.common_kwargs,
+            )
+            cols.append("P_hybrid_inverter")
+        else:
+            ctx.logger.warning(
+                "P_hybrid_inverter column not found. Skipping hybrid inverter publishing."
+            )
     return cols
 
 
@@ -2474,6 +2509,45 @@ async def _publish_grid_and_costs(ctx: PublishContext, opt_res_latest: pd.DataFr
     return cols
 
 
+async def _publish_ev_cost_curve(ctx: PublishContext) -> None:
+    """Publish EV cost curve from saved sweep results."""
+    sweep_path = ctx.input_data_dict["emhass_conf"]["data_path"] / "soc_sweep_latest.json"
+    if not sweep_path.exists():
+        return
+    try:
+        with open(sweep_path) as f:
+            sweep_results = orjson.loads(f.read())
+        entity_id = f"sensor.{ctx.common_kwargs.get('publish_prefix', '')}ev_cost_curve"
+        custom_data = {
+            "state": str(len(sweep_results)),
+            "attributes": {
+                "device_class": "monetary",
+                "unit_of_measurement": "PLN",
+                "friendly_name": "EV Cost Curve",
+                "cost_curve_forecast": sweep_results,
+            },
+        }
+        await ctx.rh.post_data(
+            pd.Series(),
+            0,
+            entity_id,
+            "monetary",
+            "PLN",
+            "EV Cost Curve",
+            type_var="ev_cost_curve",
+            custom_data=custom_data,
+            dont_post=False,
+            **{
+                k: v
+                for k, v in ctx.common_kwargs.items()
+                if k not in ("publish_prefix", "dont_post")
+            },
+        )
+        ctx.logger.info(f"Published EV cost curve with {len(sweep_results)} points")
+    except Exception as e:
+        ctx.logger.warning(f"Failed to publish EV cost curve: {e}")
+
+
 async def publish_data(
     input_data_dict: dict,
     logger: logging.Logger,
@@ -2535,6 +2609,10 @@ async def publish_data(
     cols_published.extend(await _publish_thermal_loads(ctx, opt_res_latest))
     cols_published.extend(await _publish_battery_data(ctx, opt_res_latest))
     cols_published.extend(await _publish_grid_and_costs(ctx, opt_res_latest))
+    # Publish EV cost curve only after a feasible result. This avoids reposting a stale saved
+    # curve when the current optimization produced only an infeasible status row.
+    if "P_grid" in opt_res_latest.columns:
+        await _publish_ev_cost_curve(ctx)
     # Return Summary DataFrame
     opt_res = opt_res_latest[cols_published].loc[[opt_res_latest.index[idx_closest]]]
     return opt_res
