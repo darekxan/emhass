@@ -1,10 +1,12 @@
 <div align="center">
   <br>
-  <img alt="EMHASS" src="https://raw.githubusercontent.com/davidusb-geek/emhass/master/docs/images/logo_docs.png" width="700px">
+  <img alt="EMHASS" src="https://raw.githubusercontent.com/darekxan/emhass/master/docs/images/logo_docs.png" width="700px">
   <h1>Energy Management for Home Assistant</h1>
   <strong></strong>
 </div>
 <br>
+
+> Personal testing fork notice: this repository is maintained only for private testing and custom image deployment. All original project credit, authorship, and upstream development ownership remain with the EMHASS maintainers and contributors, especially the original upstream repository authors.
 
 <p align="center">
   <a style="text-decoration:none" href="https://pypi.org/project/emhass/">
@@ -13,11 +15,11 @@
   <a style="text-decoration:none" href="https://anaconda.org/channels/davidusb/packages/emhass/overview">
     <img alt="Conda - Version" src="https://img.shields.io/conda/v/davidusb/emhass">
   </a>
-  <a style="text-decoration:none" href="https://github.com/davidusb-geek/emhass/actions">
-    <img alt="EMHASS GitHub Workflow Status" src="https://github.com/davidusb-geek/emhass/actions/workflows/publish_docker.yaml/badge.svg?event=release">
+  <a style="text-decoration:none" href="https://github.com/darekxan/emhass/actions">
+    <img alt="EMHASS GitHub Workflow Status" src="https://github.com/darekxan/emhass/actions/workflows/publish_docker.yaml/badge.svg?event=release">
   </a>
-  <a style="text-decoration:none" href="https://github.com/davidusb-geek/emhass/blob/master/LICENSE">
-    <img alt="GitHub" src="https://img.shields.io/github/license/davidusb-geek/emhass">
+  <a style="text-decoration:none" href="https://github.com/darekxan/emhass/blob/master/LICENSE">
+    <img alt="GitHub" src="https://img.shields.io/github/license/darekxan/emhass">
   </a>
   <a style="text-decoration:none" href="https://pypi.org/project/emhass/">
     <img alt="PyPI - Python Version" src="https://img.shields.io/pypi/pyversions/emhass">
@@ -28,11 +30,11 @@
   <a style="text-decoration:none" href="https://emhass.readthedocs.io/en/latest/">
     <img alt="Read the Docs" src="https://img.shields.io/readthedocs/emhass">
   </a>
-    <a hstyle="text-decoration:none" ref="https://codecov.io/github/davidusb-geek/emhass" >
-    <img src="https://codecov.io/github/davidusb-geek/emhass/branch/master/graph/badge.svg?token=BW7KSCHN90"/>
+    <a hstyle="text-decoration:none" ref="https://codecov.io/github/darekxan/emhass" >
+    <img src="https://codecov.io/github/darekxan/emhass/branch/master/graph/badge.svg?token=BW7KSCHN90"/>
   </a>
-  <a hstyle="text-decoration:none" ref="https://github.com/davidusb-geek/emhass/actions/workflows/codeql.yml" >
-    <img src="https://github.com/davidusb-geek/emhass/actions/workflows/codeql.yml/badge.svg?branch=master&event=schedule"/>
+  <a hstyle="text-decoration:none" ref="https://github.com/darekxan/emhass/actions/workflows/codeql.yml" >
+    <img src="https://github.com/darekxan/emhass/actions/workflows/codeql.yml/badge.svg?branch=master&event=schedule"/>
   </a>
   <a style="text-decoration:none" href="https://sonarcloud.io/summary/new_code?id=davidusb-geek_emhass">
     <img alt="SonarQube security rating" src="https://sonarcloud.io/api/project_badges/measure?project=davidusb-geek_emhass&metric=security_rating">
@@ -51,16 +53,16 @@
 
 <div align="center">
  <a style="text-decoration:none" href="https://emhass.readthedocs.io/en/latest/">
-      <img src="https://raw.githubusercontent.com/davidusb-geek/emhass/master/docs/images/Documentation_button.svg" alt="Documentation">
+      <img src="https://raw.githubusercontent.com/darekxan/emhass/master/docs/images/Documentation_button.svg" alt="Documentation">
   </a>
    <a style="text-decoration:none" href="https://community.home-assistant.io/t/emhass-an-energy-management-for-home-assistant/338126">
-      <img src="https://raw.githubusercontent.com/davidusb-geek/emhass/master/docs/images/Community_button.svg" alt="Community">
+      <img src="https://raw.githubusercontent.com/darekxan/emhass/master/docs/images/Community_button.svg" alt="Community">
   </a>
-  <a style="text-decoration:none" href="https://github.com/davidusb-geek/emhass/issues">
-      <img src="https://raw.githubusercontent.com/davidusb-geek/emhass/master/docs/images/Issues_button.svg" alt="Issues">
+  <a style="text-decoration:none" href="https://github.com/darekxan/emhass/issues">
+      <img src="https://raw.githubusercontent.com/darekxan/emhass/master/docs/images/Issues_button.svg" alt="Issues">
   </a>
   <a style="text-decoration:none" href="https://github.com/davidusb-geek/emhass-add-on">
-     <img src="https://raw.githubusercontent.com/davidusb-geek/emhass/master/docs/images/EMHASS_Add_on_button.svg" alt="EMHASS Add-on">
+     <img src="https://raw.githubusercontent.com/darekxan/emhass/master/docs/images/EMHASS_Add_on_button.svg" alt="EMHASS Add-on">
   </a>
 </div>
 
@@ -68,6 +70,8 @@
 <p align="left">
 EMHASS is a Python module designed to optimize your home energy interfacing with Home Assistant.
 </p>
+
+> Attribution: this fork changes deployment references for custom builds, but it does not claim ownership of the original EMHASS project.
 
 ## Introduction
 

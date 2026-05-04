@@ -57,7 +57,7 @@ test:
     - pytest
 
 about:
-  home: https://github.com/davidusb-geek/emhass
+  home: https://github.com/darekxan/emhass
   summary: An Energy Management System for Home Assistant
   license: MIT
   license_file: LICENSE

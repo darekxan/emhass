@@ -101,9 +101,9 @@ include = [
 emhass = "emhass.command_line:main_sync"
 
 [project.urls]
-Homepage = "https://github.com/davidusb-geek/emhass"
-Source = "https://github.com/davidusb-geek/emhass"
-Issues = "https://github.com/davidusb-geek/emhass/issues"
+Homepage = "https://github.com/darekxan/emhass"
+Source = "https://github.com/darekxan/emhass"
+Issues = "https://github.com/darekxan/emhass/issues"
 Documentation = "https://emhass.readthedocs.io/en/latest/"
 Community = "https://community.home-assistant.io/t/emhass-an-energy-management-for-home-assistant"
 
