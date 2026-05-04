@@ -73,7 +73,7 @@ async def publish_unified_thermal_data(
             )
             cols_published.append(temp_col_name)
 
-        # 2. Publish thermal balance (signed: + heating, - cooling)
+        # 2. Publish thermal balance (signed: + cooling, - heating)
         thermal_col_name = f"thermal_balance{k}"
         if thermal_col_name in opt_res_latest.columns and k < len(custom_thermal_balance):
             entity_conf = custom_thermal_balance[k]

@@ -2249,6 +2249,123 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "This can indicate solar gains are double-counted, driving T too high.",
         )
 
+    def test_thermal_battery_dual_mode_solar_timing_not_one_step_late(self):
+        """Dual-mode thermal_balance should apply step-1 solar gains to T[1]."""
+        horizon = len(self.df_input_data_dayahead)
+        outdoor_temps = [5.0] * horizon
+        ghi = [0.0] + [800.0] * (horizon - 1)
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "min_temperatures": [0.0] * horizon,
+            "max_temperatures": [60.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 60.0,
+            "shgc": 0.7,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+        }
+
+        opt_res_solar = self.run_thermal_battery_optimization(
+            config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+        opt_res_no_solar = self.run_thermal_battery_optimization(
+            {k: v for k, v in config.items() if k not in ("window_area", "shgc")},
+            outdoor_temps=outdoor_temps,
+        )
+
+        self.assertGreater(opt_res_solar["solar_gain_heater0"].iloc[1], 0.0)
+        self.assertGreater(
+            opt_res_solar["predicted_temp_heater0"].iloc[1],
+            opt_res_no_solar["predicted_temp_heater0"].iloc[1] + 1e-6,
+            "Dual-mode solar gains should affect T[1], not only T[2].",
+        )
+
+    def test_thermal_battery_dual_mode_hdd_fallback_sets_heating_balance(self):
+        """Dual-mode HDD fallback must expose heating demand as negative balance."""
+        horizon = len(self.df_input_data_dayahead)
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 30.0,
+            "specific_heating_demand": 250.0,
+            "area": 120.0,
+            "min_temperatures": [20.0] * horizon,
+            "max_temperatures": [35.0] * horizon,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+        }
+
+        opt_res = self.run_thermal_battery_optimization(config, outdoor_temps=[0.0] * horizon)
+
+        self.assertIn("thermal_balance_heater0", opt_res.columns)
+        self.assertLess(
+            opt_res["thermal_balance_heater0"].iloc[0],
+            0.0,
+            "HDD heating demand should be represented as negative thermal_balance.",
+        )
+        self.assertGreater(
+            opt_res["P_deferrable0"].sum(),
+            0.0,
+            "Cold HDD dual-mode case should require heat-pump operation.",
+        )
+
+    def test_thermal_battery_thermal_loss_coefficient_affects_temperature(self):
+        """Configured thermal_loss_coefficient should change the storage trajectory."""
+        horizon = len(self.df_input_data_dayahead)
+        base_config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 5.0,
+            "specific_heating_demand": 0.0,
+            "area": 100.0,
+            "min_temperatures": [0.0] * horizon,
+            "max_temperatures": [60.0] * horizon,
+        }
+
+        zero_loss = base_config.copy()
+        zero_loss["thermal_loss_coefficient"] = 0.0
+        high_loss = base_config.copy()
+        high_loss["thermal_loss_coefficient"] = 2.0
+
+        opt_zero_loss = self.run_thermal_battery_optimization(
+            zero_loss, outdoor_temps=[0.0] * horizon
+        )
+        opt_high_loss = self.run_thermal_battery_optimization(
+            high_loss, outdoor_temps=[0.0] * horizon
+        )
+
+        self.assertGreater(
+            opt_zero_loss["predicted_temp_heater0"].iloc[-1],
+            opt_high_loss["predicted_temp_heater0"].iloc[-1] + 5.0,
+        )
+
+    def test_thermal_battery_physics_first_min_temperature_none_uses_fallback_target(self):
+        """A leading None min temperature must not become the physics target."""
+        horizon = len(self.df_input_data_dayahead)
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "min_temperatures": [None] + [18.0] * (horizon - 1),
+            "max_temperatures": [30.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+        }
+
+        opt_res = self.run_thermal_battery_optimization(config, outdoor_temps=[5.0] * horizon)
+
+        self.assertIn("predicted_temp_heater0", opt_res.columns)
+
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.
 
@@ -4243,6 +4360,53 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             "cooling_cops should be updated on cache hit (update_thermal_params)",
         )
 
+    def test_thermal_battery_cache_hit_updates_temperature_dynamics(self):
+        """Forecast-dependent thermal parameters must affect reused CVXPY problems."""
+        horizon = len(self.df_input_data_dayahead)
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 5.0,
+            "min_temperatures": [0.0] * horizon,
+            "max_temperatures": [60.0] * horizon,
+            "u_value": 0.0,
+            "envelope_area": 1.0,
+            "ventilation_rate": 0.0,
+            "heated_volume": 1.0,
+            "thermal_loss_coefficient": 1.0,
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        cold_df = self.prepare_forecast_data()
+        cold_df["outdoor_temperature_forecast"] = 0.0
+        unit_load_cost = cold_df[opt.var_load_cost].values
+        unit_prod_price = cold_df[opt.var_prod_price].values
+        cold_res = opt.perform_optimization(
+            cold_df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        hot_df = cold_df.copy()
+        hot_df["outdoor_temperature_forecast"] = 30.0
+        hot_res = opt.perform_optimization(
+            hot_df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            hot_df[opt.var_load_cost].values,
+            hot_df[opt.var_prod_price].values,
+        )
+
+        self.assertGreater(
+            hot_res["predicted_temp_heater0"].iloc[-1],
+            cold_res["predicted_temp_heater0"].iloc[-1] + 5.0,
+            "Cached problem reused stale thermal constants instead of updated parameters.",
+        )
+
     def test_thermal_battery_dual_mode_fixed_cop_bypasses_carnot(self):
         """Fixed heating_cops/cooling_cops must be used instead of the Carnot formula.
 
@@ -4263,7 +4427,7 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
         config = {
             "start_temperature": 22.0,
             "supply_temperature": 35.0,
-            "volume": 200.0,
+            "volume": 50.0,
             "specific_heating_demand": 100.0,
             "area": 100.0,
             "min_temperatures": [18.0] * horizon,
