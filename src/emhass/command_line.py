@@ -23,6 +23,10 @@ from emhass.machine_learning_forecaster import MLForecaster
 from emhass.machine_learning_regressor import MLRegressor
 from emhass.optimization import Optimization
 from emhass.retrieve_hass import RetrieveHass
+from emhass.thermal_balance_publisher import (
+    publish_unified_thermal_data,
+    update_thermal_sensor_config,
+)
 
 default_csv_filename = "opt_res_latest.csv"
 default_pkl_suffix = "_mlf.pkl"
@@ -1333,8 +1337,18 @@ def prepare_forecast_and_weather_data(
                 .fillna(method="bfill")
             )
 
-    # Merge GHI (Global Horizontal Irradiance) from weather forecast if available
-    if input_data_dict["df_weather"] is not None and "ghi" in input_data_dict["df_weather"].columns:
+    # Add GHI if provided explicitly
+    if input_data_dict["params"]["passed_data"].get("ghi_forecast") is not None:
+        df_input_data_dayahead["ghi"] = input_data_dict["params"]["passed_data"]["ghi_forecast"]
+        logger.info(
+            "Using passed ghi_forecast data for optimization input: %s points",
+            len(df_input_data_dayahead["ghi"]),
+        )
+
+    # Otherwise merge GHI (Global Horizontal Irradiance) from weather forecast if available
+    elif (
+        input_data_dict["df_weather"] is not None and "ghi" in input_data_dict["df_weather"].columns
+    ):
         dayahead_index = df_input_data_dayahead.index
         ghi_series = input_data_dict["df_weather"]["ghi"].copy()
 
@@ -1465,6 +1479,7 @@ async def naive_mpc_optim(
 
     """
     logger.info("Performing naive MPC optimization")
+    logger.info("EMHASS hotpatch active: custom ghi_forecast MPC support enabled")
     # Prepare forecast data with costs, prices, outdoor temp, and GHI (with resolution warning)
     df_input_data_dayahead = prepare_forecast_and_weather_data(
         input_data_dict, logger, warn_on_resolution=True
@@ -2176,15 +2191,51 @@ async def _publish_thermal_variable(
 
 
 async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFrame) -> list[str]:
-    """Publish predicted temperature and heating demand for thermal loads."""
+    """Publish thermal data using either the unified or legacy approach."""
     cols = []
+
+    # Check if unified thermal model is being used
+    unified_thermal_model = False
+    def_load_config = ctx.optim_conf.get("def_load_config", [])
+    if isinstance(def_load_config, list):
+        for load_cfg in def_load_config:
+            if load_cfg.get("use_unified_thermal_model", False):
+                unified_thermal_model = True
+                break
+
+    # If unified thermal model is being used, use the dedicated publisher
+    if unified_thermal_model:
+        # Update sensor configuration to include thermal balance sensors if needed
+        ctx.params["passed_data"] = update_thermal_sensor_config(
+            ctx.params["passed_data"], def_load_config
+        )
+
+        # Use unified thermal balance publisher
+        unified_cols = await publish_unified_thermal_data(
+            ctx.rh,
+            opt_res_latest,
+            ctx.idx,
+            ctx.params,
+            ctx.optim_conf,
+            ctx.logger,
+            **ctx.common_kwargs,
+        )
+        cols.extend(unified_cols)
+        return cols
+
+    # Otherwise use legacy thermal publishing approach
     if "custom_predicted_temperature_id" not in ctx.params["passed_data"]:
         return cols
+
     custom_temp = ctx.params["passed_data"]["custom_predicted_temperature_id"]
     custom_heat = ctx.params["passed_data"].get("custom_heating_demand_id")
-    def_load_config = ctx.optim_conf.get("def_load_config", [])
+    custom_solar = ctx.params["passed_data"].get("custom_solar_gain_id")
+    custom_thermal_balance = ctx.params["passed_data"].get("custom_thermal_balance_id")
+    custom_thermal_mode = ctx.params["passed_data"].get("custom_thermal_mode_id")
+
     if not isinstance(def_load_config, list):
         def_load_config = []
+
     for k in range(ctx.optim_conf["number_of_deferrable_loads"]):
         if k >= len(def_load_config):
             continue
@@ -2217,6 +2268,61 @@ async def _publish_thermal_loads(ctx: PublishContext, opt_res_latest: pd.DataFra
         )
         if col_h:
             cols.append(col_h)
+        col_s = await _publish_thermal_variable(
+            ctx.rh,
+            opt_res_latest,
+            ctx.idx,
+            k,
+            custom_solar,
+            "solar_gain_heater",
+            "energy",
+            "energy",
+            ctx.common_kwargs,
+        )
+        if col_s:
+            cols.append(col_s)
+        # Publish signed thermal balance for dual-mode thermal batteries
+        # (positive = cooling need, negative = heating need)
+        col_c = await _publish_thermal_variable(
+            ctx.rh,
+            opt_res_latest,
+            ctx.idx,
+            k,
+            custom_thermal_balance,
+            "thermal_balance_heater",
+            "energy",
+            "energy",
+            ctx.common_kwargs,
+        )
+        if col_c:
+            cols.append(col_c)
+        # Publish thermal mode (0=off, 1=heating, 2=cooling) for dual-mode thermal batteries
+        if custom_thermal_mode and k < len(custom_thermal_mode):
+            # Construct thermal mode: 0=off, 1=heating, 2=cooling
+            # Use heat_active and cool_active columns if available
+            heat_active_col = f"heat_active{k}"
+            cool_active_col = f"cool_active{k}"
+            if (
+                heat_active_col in opt_res_latest.columns
+                and cool_active_col in opt_res_latest.columns
+            ):
+                heat_active = opt_res_latest[heat_active_col].astype(int)
+                cool_active = opt_res_latest[cool_active_col].astype(int)
+                # thermal_mode: 0 = off, 1 = heating (heat_active=1), 2 = cooling (cool_active=1)
+                thermal_mode = heat_active * 1 + cool_active * 2
+                entity_conf = custom_thermal_mode[k]
+                await ctx.rh.post_data(
+                    thermal_mode,
+                    ctx.idx,
+                    entity_conf["entity_id"],
+                    "thermal_mode",
+                    entity_conf["unit_of_measurement"],
+                    entity_conf["friendly_name"],
+                    type_var="thermal_mode",
+                    **ctx.common_kwargs,
+                )
+                # thermal_mode is computed on-the-fly and posted to HA but is not
+                # stored as a column in opt_res_latest, so don't add it to cols.
     return cols
 
 

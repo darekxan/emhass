@@ -1964,6 +1964,12 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
 
         # Verify heat pump behavior is reasonable
         total_heat_pump_energy = opt_res["P_deferrable0"].sum()
+        self.assertIn("solar_gain_heater0", opt_res.columns)
+        self.assertGreater(
+            opt_res["solar_gain_heater0"].sum(),
+            0.0,
+            "Solar gain result column should contain positive gains during sunny periods",
+        )
         # Note: Heat pump may run zero energy if solar gains completely offset heating needs
         # and thermal battery stays within temperature bounds. This is valid optimizer behavior.
         self.assertGreaterEqual(
@@ -1977,29 +1983,205 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             print(f"Total heat pump energy with solar gains: {total_heat_pump_energy:.3f} kW")
 
         # The key validation is that the optimization completes successfully with solar gains
+
+    def test_thermal_battery_solar_gains_can_raise_predicted_temperature(self):
+        """Passive solar gains should directly raise thermal battery predicted temperature."""
+        horizon = len(self.df_input_data_dayahead)
+        outdoor_temps = [18.0] * horizon
+        ghi = [0.0] * horizon
+        for i in range(horizon):
+            hour_of_day = (i % 48) / 2
+            if 8 <= hour_of_day <= 16:
+                ghi[i] = 700.0 * np.sin((hour_of_day - 8) * np.pi / 8)
+
+        base_config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 20.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [15.0] * horizon,
+            "max_temperatures": [35.0] * horizon,
+            "u_value": 0.35,
+            "envelope_area": 320.0,
+            "ventilation_rate": 0.35,
+            "heated_volume": 240.0,
+        }
+
+        opt_res_no_solar = self.run_thermal_battery_optimization(
+            base_config.copy(), outdoor_temps=outdoor_temps
+        )
+
+        solar_config = base_config.copy()
+        solar_config["window_area"] = 50.0
+        solar_config["shgc"] = 0.7
+        opt_res_solar = self.run_thermal_battery_optimization(
+            solar_config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        self.assertIn("solar_gain_heater0", opt_res_solar.columns)
+        self.assertGreater(opt_res_solar["solar_gain_heater0"].max(), 0.0)
+        self.assertGreater(
+            opt_res_solar["predicted_temp_heater0"].max(),
+            opt_res_no_solar["predicted_temp_heater0"].max() + 0.1,
+            "Solar gains should raise predicted temperature above the no-solar case",
+        )
+        self.assertGreater(
+            opt_res_solar["predicted_temp_heater0"].iloc[-1],
+            opt_res_no_solar["predicted_temp_heater0"].iloc[-1],
+            "Solar gains should leave the thermal battery warmer by the end of the horizon",
+        )
         # enabled. The INFO log "Using physics-based heating demand with solar gains" confirms
         # the feature is working. The optimizer may choose not to heat if solar gains fully
         # offset heating demand and the thermal battery remains within temperature bounds.
 
-        # NEW: Verify solar gains actually reduce heating demand
-        # Compare average heating power during sunny periods vs night periods
-        heating_power = opt_res["P_deferrable0"].values
-        total_heat_pump_energy = heating_power.sum()
+    def test_thermal_battery_solar_gains_timing_not_one_step_late(self):
+        """Solar gains must affect the predicted temperature at the same timestep, not one step late.
 
-        # Calculate average heating during sunny and night periods
-        if sunny_hours.sum() > 0 and night_hours.sum() > 0 and total_heat_pump_energy > 0:
-            avg_heating_sunny = heating_power[sunny_hours].mean()
-            avg_heating_night = heating_power[night_hours].mean()
+        Regression test for the timing bug where solar_gains_arr[:-1] (GHI at t) was used to
+        compute T[t+1], making the optimizer respond to solar one full timestep after the peak.
+        The fix uses solar_gains_arr[1:] so GHI at t+1 is accounted for in T[t+1].
 
-            # During sunny periods, solar gains should reduce the need for active heating
-            # Therefore, average heating power during sunny periods should be less than or equal
-            # to night periods (assuming outdoor temps are similar due to the sin pattern)
-            self.assertLessEqual(
-                avg_heating_sunny,
-                avg_heating_night,
-                f"Solar gains should reduce heating demand during sunny periods. "
-                f"Sunny period avg: {avg_heating_sunny:.3f} kW, Night avg: {avg_heating_night:.3f} kW",
+        We verify this by running a short optimisation with a step-function GHI that turns on
+        at step 1 (index 1) and checking that predicted_temp already reflects the gain by step 1
+        (i.e. T[1] > T[0]) rather than only at step 2.
+        """
+        horizon = len(self.df_input_data_dayahead)
+        # Cold flat outdoor temp — building would cool without gains
+        outdoor_temps = [5.0] * horizon
+        # GHI = 0 at step 0, then large constant value from step 1 onwards
+        ghi = [0.0] + [800.0] * (horizon - 1)
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [0.0] * horizon,  # loose — don't force heating
+            "max_temperatures": [50.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 60.0,
+            "shgc": 0.7,
+        }
+
+        opt_res = self.run_thermal_battery_optimization(
+            config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        solar_gain_col = opt_res["solar_gain_heater0"].values
+
+        # Solar gains must be non-zero from step 1 onwards in the output column
+        self.assertGreater(
+            solar_gain_col[1],
+            0.0,
+            "solar_gain_heater0 must be non-zero at step 1 when GHI turns on at step 1",
+        )
+
+        # Run the no-solar baseline for comparison
+        config_no_solar = {k: v for k, v in config.items() if k not in ("window_area", "shgc")}
+        opt_res_no_solar = self.run_thermal_battery_optimization(
+            config_no_solar, outdoor_temps=outdoor_temps
+        )
+
+        temp_solar = opt_res["predicted_temp_heater0"].values
+        temp_no_solar = opt_res_no_solar["predicted_temp_heater0"].values
+
+        # From step 1 onwards the solar variant must be warmer (or equal) to the no-solar case
+        for step in range(1, min(6, horizon)):
+            self.assertGreaterEqual(
+                temp_solar[step],
+                temp_no_solar[step] - 1e-6,
+                f"At step {step} solar variant (T={temp_solar[step]:.3f}) should be >= "
+                f"no-solar variant (T={temp_no_solar[step]:.3f}). "
+                "Solar gains are influencing temperature too late (off-by-one regression).",
             )
+
+        # Confirm the solar effect is already visible at step 1 (not only from step 2 onward).
+        # With GHI[0]=0 and GHI[1..N]=800:
+        #   Fixed code  (solar_gains_arr[1:]): T[1] uses GHI[1] → non-zero effect at step 1
+        #   Buggy code  (solar_gains_arr[:-1]): T[1] uses GHI[0]=0 → zero effect at step 1
+        solar_effect_step1 = temp_solar[1] - temp_no_solar[1]
+        self.assertGreater(
+            solar_effect_step1,
+            1e-6,
+            "Solar gain effect must be non-zero at step 1 when GHI turns on at step 1. "
+            "A zero effect here means the off-by-one timing regression is present "
+            "(solar_gains_arr[:-1] was used instead of solar_gains_arr[1:]).",
+        )
+
+    def test_thermal_battery_dual_mode_solar_not_double_counted(self):
+        """In dual-mode, solar gains embedded in thermal_balance must not be added twice.
+
+        Regression test for the double-counting bug where solar_gains_arr was added
+        separately in the temperature constraint even though it was already subtracted
+        inside thermal_balance (and thus inside heating_demand_arr / cooling_demand_arr).
+
+        We verify by comparing single-mode and dual-mode predictions under identical
+        physics-based configs: both must agree on the solar gain column value and must
+        produce a temperature trajectory that is physically consistent (solar raises T,
+        not 2x the expected amount).
+        """
+        horizon = len(self.df_input_data_dayahead)
+        outdoor_temps = [10.0] * horizon
+        # Steady solar irradiance throughout
+        ghi = [500.0] * horizon
+
+        base = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [18.0] * horizon,
+            "max_temperatures": [30.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 40.0,
+            "shgc": 0.6,
+        }
+
+        single_config = base.copy()
+        opt_single = self.run_thermal_battery_optimization(
+            single_config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        dual_config = base.copy()
+        dual_config["dual_mode_enabled"] = True
+        dual_config["cool_supply_temperature"] = 12.0
+        dual_config["heat_supply_temperature"] = 35.0
+        dual_config["heat_carnot_efficiency"] = 0.4
+        dual_config["cool_carnot_efficiency"] = 0.45
+        opt_dual = self.run_thermal_battery_optimization(
+            dual_config, outdoor_temps=outdoor_temps, ghi=ghi
+        )
+
+        # Both columns must be present
+        self.assertIn("solar_gain_heater0", opt_single.columns)
+        self.assertIn("solar_gain_heater0", opt_dual.columns)
+
+        # Solar gain column values must be identical in both modes (same GHI, same window)
+        np.testing.assert_allclose(
+            opt_single["solar_gain_heater0"].values,
+            opt_dual["solar_gain_heater0"].values,
+            rtol=1e-6,
+            err_msg="solar_gain_heater0 must be identical in single- and dual-mode "
+            "(both use same GHI / window params). Double-counting would show up "
+            "as a discrepancy here.",
+        )
+
+        # In dual-mode the temperature trajectory must stay within bounds
+        temp_dual = opt_dual["predicted_temp_heater0"].values
+        self.assertTrue(
+            np.all(temp_dual <= 30.0 + 1e-4),
+            "Dual-mode predicted temperature exceeded max_temperature. "
+            "This can indicate solar gains are double-counted, driving T too high.",
+        )
 
     def test_thermal_battery_variable_temperature_bounds(self):
         """Test thermal battery with non-uniform per-timestep temperature bounds.
@@ -3887,6 +4069,632 @@ class TestOptimization(unittest.IsolatedAsyncioTestCase):
             np.allclose(opt_res["P_deferrable1"], 0.0),
             "Load 1 with 0 hours should be deactivated",
         )
+
+    # ── thermal_battery dual-mode cache warm-start gap regression tests ─────────
+
+    def test_thermal_battery_dual_mode_params_preallocated(self):
+        """Verify cooling_cops and thermal_balance are pre-allocated at init time.
+
+        Before the fix, these were only created lazily inside
+        _add_thermal_battery_constraints, so update_thermal_params on a cache
+        hit would silently skip them, leaving stale zero values.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        # Both dual-mode parameters must be in param_thermal right after init
+        self.assertIn(0, opt.param_thermal)
+        self.assertIn("cooling_cops", opt.param_thermal[0])
+        self.assertIn("thermal_balance", opt.param_thermal[0])
+
+        # Their values should be pre-filled (not None)
+        self.assertIsNotNone(opt.param_thermal[0]["cooling_cops"].value)
+        self.assertIsNotNone(opt.param_thermal[0]["thermal_balance"].value)
+
+    def test_thermal_battery_dual_mode_cache_update_cooling_params(self):
+        """Verify update_thermal_params refreshes cooling_cops and thermal_balance.
+
+        Simulates a cache hit by calling update_thermal_params after a first
+        solve and verifying the cooling parameters received fresh values.
+        """
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        # First call: cold outdoor → heating
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 5.0
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        unit_load_cost = self.df_input_data_dayahead[opt.var_load_cost].values
+        unit_prod_price = self.df_input_data_dayahead[opt.var_prod_price].values
+        opt.perform_optimization(
+            self.df_input_data_dayahead,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        # Capture cooling_cops after first solve (cold outdoor)
+        cool_cops_after_first = opt.param_thermal[0]["cooling_cops"].value.copy()
+
+        # Simulate cache hit: new outdoor temps (hot → different cooling COPs)
+        hot_df = self.df_input_data_dayahead.copy()
+        hot_df["outdoor_temperature_forecast"] = 35.0
+        opt.update_thermal_params(
+            self.optim_conf,
+            hot_df,
+            self.p_load_forecast.values.ravel(),
+        )
+
+        cool_cops_after_update = opt.param_thermal[0]["cooling_cops"].value
+
+        # cooling_cops must have changed when outdoor temperature changed
+        self.assertFalse(
+            np.allclose(cool_cops_after_first, cool_cops_after_update),
+            "cooling_cops should be updated on cache hit (update_thermal_params)",
+        )
+
+    def test_thermal_battery_dual_mode_fixed_cop_bypasses_carnot(self):
+        """Fixed heating_cops/cooling_cops must be used instead of the Carnot formula.
+
+        Regression test for the GSHP scenario: outdoor temps are all 12 °C, below the
+        cool_supply_temperature of 18 °C.  Without the fix, calculate_cop_dual_mode
+        would set cooling COP=1.0 for every timestep.  With COP=1.0 the 2.1 kW pump
+        delivers only 2.1 kW of cooling against ~14 kW of solar gain → infeasible.
+
+        With the fix the config-supplied cooling_cops=5.0 is used, delivering
+        ~10 kW of cooling which can match the solar gain → feasible.
+        """
+        horizon = len(self.df_input_data_dayahead)
+        # All outdoor temps below cool_supply_temperature → Carnot formula gives COP=1.0
+        outdoor_temps = [12.0] * horizon
+        # Strong solar irradiance throughout to force the LP to use cooling
+        ghi = [800.0] * horizon
+
+        config = {
+            "start_temperature": 22.0,
+            "supply_temperature": 35.0,
+            "volume": 200.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [18.0] * horizon,
+            "max_temperatures": [26.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "window_area": 60.0,
+            "shgc": 0.7,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 18.0,  # outdoor (12 °C) is below this threshold
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            # Fixed GSHP manufacturer COPs — must override the Carnot formula
+            "heating_cops": [4.4],
+            "cooling_cops": [5.0],
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = outdoor_temps
+        df["ghi"] = ghi
+
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt_res = opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        # 1. Optimization must not be infeasible (result is a non-empty DataFrame)
+        self.assertIsInstance(opt_res, pd.DataFrame)
+        self.assertGreater(
+            len(opt_res), 0, "Optimization returned empty result — likely infeasible"
+        )
+        self.assertFalse(
+            opt_res["P_deferrable0"].isna().all(),
+            "P_deferrable0 is all-NaN — optimization was infeasible with fixed COPs",
+        )
+
+        # 2. Cooling must have been active at some point (solar gains drove temp up)
+        self.assertIn("cool_active0", opt_res.columns)
+        self.assertGreater(
+            opt_res["cool_active0"].sum(),
+            0,
+            "cool_active0 never non-zero — fixed COPs did not enable cooling",
+        )
+
+        # 3. The installed cooling_cops parameter must equal the fixed value (5.0), not 1.0
+        np.testing.assert_allclose(
+            opt.param_thermal[0]["cooling_cops"].value,
+            np.full(horizon, 5.0),
+            rtol=1e-6,
+            err_msg="cooling_cops parameter is not 5.0 — fixed-COP override was not applied",
+        )
+
+    def test_thermal_battery_dual_mode_fixed_cop_preserved_on_cache_hit(self):
+        """Fixed COPs must survive a cache hit (update_thermal_params must not overwrite them).
+
+        On a second MPC call the CVXPY problem is reused (cache hit) and
+        update_thermal_params is called instead of a full rebuild.  The fixed
+        heating_cops/cooling_cops values must stay at the configured constants
+        regardless of the new outdoor temperature forecast.
+        """
+        horizon = len(self.df_input_data_dayahead)
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+            "min_temperatures": [18.0] * horizon,
+            "max_temperatures": [26.0] * horizon,
+            "u_value": 0.3,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.4,
+            "heated_volume": 250.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 18.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "heating_cops": [4.4],
+            "cooling_cops": [5.0],
+        }
+
+        self.optim_conf["def_load_config"] = [{"thermal_battery": config}]
+        opt = self.create_optimization()
+
+        # First solve
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = 12.0
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        cops_after_first = opt.param_thermal[0]["cooling_cops"].value.copy()
+        np.testing.assert_allclose(
+            cops_after_first,
+            np.full(horizon, 5.0),
+            rtol=1e-6,
+            err_msg="cooling_cops not 5.0 after first solve",
+        )
+
+        # Simulate a cache-hit update with a very different outdoor temperature (35 °C).
+        # Without the fix, update_thermal_params would recalculate COPs from 35 °C
+        # via calculate_cop_dual_mode and overwrite the fixed value.
+        hot_df = df.copy()
+        hot_df["outdoor_temperature_forecast"] = 35.0
+        opt.update_thermal_params(
+            self.optim_conf,
+            hot_df,
+            self.p_load_forecast.values.ravel(),
+        )
+
+        cops_after_update = opt.param_thermal[0]["cooling_cops"].value
+        np.testing.assert_allclose(
+            cops_after_update,
+            np.full(horizon, 5.0),
+            rtol=1e-6,
+            err_msg=(
+                "cooling_cops changed after update_thermal_params cache hit — "
+                "fixed COPs were overwritten by the Carnot formula"
+            ),
+        )
+
+    def test_thermal_battery_dual_mode_result_columns(self):
+        """Verify dual-mode result columns heat_active and cool_active are present."""
+        self.df_input_data_dayahead = self.prepare_forecast_data()
+        self.df_input_data_dayahead["outdoor_temperature_forecast"] = 10.0
+
+        config = {
+            "start_temperature": 20.0,
+            "supply_temperature": 35.0,
+            "volume": 50.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+            "specific_heating_demand": 100.0,
+            "area": 100.0,
+        }
+
+        opt_res = self.run_optimization_with_config([{"thermal_battery": config}])
+
+        self.assertIn("heat_active0", opt_res.columns)
+        self.assertIn("cool_active0", opt_res.columns)
+
+        # Mutual exclusivity: heat_active + cool_active <= 1 at every timestep
+        mutual = opt_res["heat_active0"] + opt_res["cool_active0"]
+        self.assertTrue(
+            (mutual <= 1).all(),
+            "Mutual exclusivity violated: heat_active + cool_active > 1",
+        )
+
+    # ── thermal_config dual-mode tests ──────────────────────────────────────────
+
+    def _make_thermal_config_dual_mode(self, outdoor_temps=10.0):
+        """Return a prepared DataFrame and dual-mode thermal_config dict."""
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = outdoor_temps
+        config = {
+            "start_temperature": 20.0,
+            "cooling_constant": 0.1,
+            "heating_rate": 10.0,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "cool_supply_temperature": 12.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_carnot_efficiency": 0.45,
+            "u_value": 0.5,
+            "envelope_area": 300.0,
+            "ventilation_rate": 0.5,
+            "heated_volume": 250.0,
+            "indoor_target_temperature": 22.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+        }
+        return df, config
+
+    def test_thermal_config_dual_mode_solves(self):
+        """Basic sanity: dual-mode thermal_config optimization solves successfully."""
+        df, config = self._make_thermal_config_dual_mode()
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        self.assertIsInstance(opt_res, type(pd.DataFrame()))
+        self.assertIn("P_deferrable0", opt_res.columns)
+        self.assertIn("predicted_temp_heater0", opt_res.columns)
+
+    def test_thermal_config_dual_mode_result_columns(self):
+        """Dual-mode thermal_config should produce heat_active and cool_active columns.
+
+        Note: thermal_config uses an RC model and does not emit cooling_demand_heater{k}
+        (that is a thermal_battery physics-model concept). The mode indicators and
+        predicted temperature are the primary dual-mode outputs for thermal_config.
+        """
+        df, config = self._make_thermal_config_dual_mode()
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        self.assertIn("heat_active0", opt_res.columns, "heat_active0 missing from result")
+        self.assertIn("cool_active0", opt_res.columns, "cool_active0 missing from result")
+        self.assertIn(
+            "predicted_temp_heater0", opt_res.columns, "predicted_temp_heater0 missing from result"
+        )
+
+    def test_thermal_config_dual_mode_mutual_exclusivity(self):
+        """heat_active + cool_active must never exceed 1 at any timestep."""
+        df, config = self._make_thermal_config_dual_mode()
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        mutual = opt_res["heat_active0"] + opt_res["cool_active0"]
+        self.assertTrue(
+            (mutual <= 1 + 1e-6).all(),
+            "Mutual exclusivity violated: heat_active + cool_active > 1",
+        )
+
+    def test_thermal_config_dual_mode_heating_when_cold(self):
+        """Optimizer should activate heating (not cooling) when outdoor temp is cold."""
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-10.0)
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        # When it's very cold, cooling activity should be zero or near-zero
+        cool_total = opt_res["cool_active0"].sum()
+        heat_total = opt_res["heat_active0"].sum()
+        self.assertGreater(heat_total, 0, "Expected heating to be scheduled at -10°C")
+        self.assertGreater(
+            heat_total,
+            cool_total,
+            "Expected more heating than cooling activity when outdoor temp is -10°C",
+        )
+
+    def test_thermal_config_dual_mode_cooling_when_hot(self):
+        """Optimizer should activate cooling (not heating) when outdoor temp is very hot."""
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=40.0)
+        # Hot scenario: lower the max temp so cooling is actually needed
+        config["max_temperatures"] = [24.0] * 48
+        config["min_temperatures"] = [18.0] * 48
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        cool_total = opt_res["cool_active0"].sum()
+        heat_total = opt_res["heat_active0"].sum()
+        self.assertGreater(cool_total, 0, "Expected cooling to be scheduled at 40°C")
+        self.assertGreaterEqual(
+            cool_total,
+            heat_total,
+            "Expected at least as much cooling as heating when outdoor temp is 40°C",
+        )
+
+    def test_thermal_config_dual_mode_backward_compat(self):
+        """thermal_config without dual_mode_enabled must still work (single-mode)."""
+        df = self.prepare_forecast_data()
+        df["outdoor_temperature_forecast"] = 10.0
+        self.df_input_data_dayahead = df
+
+        single_config = {
+            "start_temperature": 20.0,
+            "cooling_constant": 0.1,
+            "heating_rate": 10.0,
+            "min_temperatures": [18.0] * 48,
+            "max_temperatures": [26.0] * 48,
+        }
+
+        opt_res = self.run_optimization_with_config([{"thermal_config": single_config}])
+
+        self.assertIsInstance(opt_res, type(pd.DataFrame()))
+        self.assertIn("P_deferrable0", opt_res.columns)
+        # No dual-mode columns should appear
+        self.assertNotIn("heat_active0", opt_res.columns)
+        self.assertNotIn("cool_active0", opt_res.columns)
+
+    def test_thermal_config_dual_mode_params_preallocated(self):
+        """Verify dual-mode CVXPY params are pre-allocated in _init_deferrable_load_params."""
+        _, config = self._make_thermal_config_dual_mode()
+
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        opt = self.create_optimization()
+
+        self.assertIn(0, opt.param_thermal)
+        for expected_key in (
+            "heatpump_cops",
+            "cooling_cops",
+            "thermal_balance",
+            "solar_gains",
+        ):
+            self.assertIn(
+                expected_key,
+                opt.param_thermal[0],
+                f"Expected '{expected_key}' pre-allocated in param_thermal[0]",
+            )
+            self.assertIsNotNone(opt.param_thermal[0][expected_key].value)
+
+    def test_thermal_config_dual_mode_cache_update_params(self):
+        """Verify update_thermal_params refreshes cooling params for thermal_config dual-mode."""
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=5.0)
+        self.df_input_data_dayahead = df
+
+        self.optim_conf["def_load_config"] = [{"thermal_config": config}]
+        opt = self.create_optimization()
+
+        unit_load_cost = df[opt.var_load_cost].values
+        unit_prod_price = df[opt.var_prod_price].values
+        opt.perform_optimization(
+            df,
+            self.p_pv_forecast.values.ravel(),
+            self.p_load_forecast.values.ravel(),
+            unit_load_cost,
+            unit_prod_price,
+        )
+
+        cool_cops_cold = opt.param_thermal[0]["cooling_cops"].value.copy()
+
+        # Simulate cache hit with hot outdoor temps
+        hot_df = df.copy()
+        hot_df["outdoor_temperature_forecast"] = 35.0
+        opt.update_thermal_params(
+            self.optim_conf,
+            hot_df,
+            self.p_load_forecast.values.ravel(),
+        )
+
+        cool_cops_hot = opt.param_thermal[0]["cooling_cops"].value
+        self.assertFalse(
+            np.allclose(cool_cops_cold, cool_cops_hot),
+            "cooling_cops for thermal_config should be updated on cache hit",
+        )
+
+    def test_thermal_config_dual_mode_no_min_runtime_allows_short_runs(self):
+        """Without min_runtime the optimizer is free to switch the heat pump on for
+        a single timestep — confirming the constraint is what enforces longer runs.
+
+        Parameter choice rationale:
+        - heating_rate=1.5 → ΔT_on ≈ 2.3°C/step (COP≈3.1 × 1.5 × 0.5h / 3000W × 3000W)
+        - natural cooling ≈ 1.25°C/step at T=20°C, outdoor=-5°C
+        - one pump step brings T from ~16°C to ~18°C; two off-steps then drop it back
+          to ~16°C → stable 1-on/1-off alternation with single-step heat_active pulses
+        - the default helper heating_rate=10.0 gives ΔT_on≈15°C which always overshoots
+          the [16,28] band, making the MILP infeasible and forcing a relaxed-LP fallback
+          that runs at fractional continuous power (no discrete pulses)
+        """
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-5.0)
+        # Scale down heating power so one binary pump step stays within [16, 28]
+        config["heating_rate"] = 1.5
+        # No min_runtime key → defaults to 1 (no constraint)
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        # Uniform pricing: remove peak/off-peak incentive to pre-heat to max_temp.
+        # With peak pricing the LP runs long blocks during cheap periods (optimising
+        # cost, not cycling), so no single-step pulse would appear.  Uniform pricing
+        # forces the LP to minimise total on-time which naturally produces short pulses.
+        df["unit_load_cost"] = 0.20
+        df["unit_prod_price"] = 0.10
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        heat = opt_res["heat_active0"].values.round().astype(int)
+        # Find any single-timestep run: 0→1→0
+        has_short_run = any(
+            heat[t] == 1
+            and (t == 0 or heat[t - 1] == 0)
+            and (t == len(heat) - 1 or heat[t + 1] == 0)
+            for t in range(len(heat))
+        )
+        self.assertTrue(
+            has_short_run,
+            "Expected at least one single-timestep heat_active run without min_runtime, "
+            "but none found — the test scenario may need adjustment.",
+        )
+
+    def test_thermal_config_dual_mode_min_runtime(self):
+        """min_runtime must prevent the heat pump from switching off before staying on
+        for the specified number of consecutive timesteps.
+
+        Uses heating_rate=1.5 (same as the no-min_runtime companion test) so the MILP
+        is feasible with binary on/off control — see that test's docstring for details.
+        """
+        min_rt = 4
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-5.0)
+        config["min_runtime"] = min_rt
+        config["heating_rate"] = 1.5
+        # Widen the temperature band so the optimizer has room to switch off mid-horizon
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        heat = opt_res["heat_active0"].values.round().astype(int)
+        # Check every rising edge: once heat_active goes 0→1, the next (min_rt-1)
+        # timesteps must all be 1 (or we must be at the end of the horizon).
+        violations = 0
+        for t in range(1, len(heat)):
+            if heat[t] == 1 and heat[t - 1] == 0:
+                for i in range(1, min_rt):
+                    if t + i < len(heat) and heat[t + i] == 0:
+                        violations += 1
+                        break
+        self.assertEqual(
+            violations,
+            0,
+            f"min_runtime={min_rt} violated: heat pump switched off before staying on "
+            f"for {min_rt} consecutive timesteps",
+        )
+
+    def test_thermal_config_dual_mode_min_runtime_t0_boundary(self):
+        """min_runtime must also apply when the HP starts at t=0 (was OFF previously).
+
+        Regression test for the bug where the loop started at t=1, allowing the
+        optimizer to run the HP for a single timestep at t=0 with no constraint.
+        """
+        min_rt = 4
+        df, config = self._make_thermal_config_dual_mode(outdoor_temps=-10.0)
+        config["min_runtime"] = min_rt
+        config["heating_rate"] = 1.5
+        config["min_temperatures"] = [16.0] * 48
+        config["max_temperatures"] = [28.0] * 48
+        self.df_input_data_dayahead = df
+        # Start with HP OFF so t=0 is a potential start-up timestep
+        self.optim_conf["def_current_state"] = [False]
+        opt_res = self.run_optimization_with_config([{"thermal_config": config}])
+
+        heat = opt_res["heat_active0"].values.round().astype(int)
+        cool = (
+            opt_res.get("cool_active0", pd.Series(0, index=opt_res.index))
+            .values.round()
+            .astype(int)
+        )
+
+        # Check t=0 boundary: if HP starts at t=0 it must stay on for min_rt steps
+        for mode_arr in (heat, cool):
+            if mode_arr[0] == 1:
+                for i in range(1, min(min_rt, len(mode_arr))):
+                    self.assertEqual(
+                        mode_arr[i],
+                        1,
+                        f"min_runtime={min_rt} violated at t=0: mode switched off at t={i}",
+                    )
+
+    def test_thermal_battery_dual_mode_transition_cooldown_feasible_after_multi_step_cool(self):
+        """transition_cooldown must remain feasible when cooling runs for multiple
+        consecutive steps (>1).
+
+        Regression test for the SUM-based constraint bug: summing binary variables over
+        the cooldown window produced a coefficient > 1 (e.g. SUM=8 for 8 cooling steps),
+        making  heat_active[t] + 8 <= 1  impossible for a binary variable.
+        """
+        n = 48  # match the default prepare_forecast_data() horizon
+        outdoor = [35.0] * n  # always hot → forces cooling
+        ghi = [1000.0] * n
+
+        config = {
+            "volume": 10.0,
+            "start_temperature": 24.0,
+            "min_temperatures": [20.0] * n,
+            "max_temperatures": [26.0] * n,
+            "u_value": 0.3,
+            "envelope_area": 200.0,
+            "ventilation_rate": 0.3,
+            "heated_volume": 300.0,
+            "indoor_target_temperature": 22.0,
+            "supply_temperature": 35.0,
+            "carnot_efficiency": 0.4,
+            "dual_mode_enabled": True,
+            "heat_supply_temperature": 35.0,
+            "heat_carnot_efficiency": 0.4,
+            "cool_supply_temperature": 12.0,
+            "cool_carnot_efficiency": 0.45,
+            "min_runtime": 4,
+            "transition_cooldown": 6,
+            "window_area": 20.0,
+            "shgc": 0.3,
+        }
+        opt_res = self.run_thermal_battery_optimization(config, outdoor_temps=outdoor, ghi=ghi)
+        self.assertIsNotNone(opt_res, "Optimization must not return None (feasibility failure)")
 
 
 if __name__ == "__main__":

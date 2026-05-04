@@ -235,6 +235,260 @@ def calculate_cop_heatpump(
     return cop_values
 
 
+def calculate_cop_dual_mode(
+    heat_supply_temperature: float,
+    cool_supply_temperature: float,
+    heat_carnot_efficiency: float,
+    cool_carnot_efficiency: float,
+    outdoor_temperature_forecast: np.ndarray | pd.Series,
+) -> tuple[np.ndarray, np.ndarray]:
+    r"""
+    Calculate COPs for both heating and cooling modes simultaneously.
+
+    This function calculates separate Coefficient of Performance (COP) values
+    for heating and cooling operations using Carnot-based formulas. This enables
+    dual-mode operation where the optimizer can choose the most efficient mode
+    at each timestep.
+
+    **Heating COP:**
+
+    .. math::
+        COP_{heat}(h) = \eta_{carnot,heat} \times \frac{T_{supply,heat\_K}}{T_{supply,heat\_K} - T_{outdoor\_K}(h)}
+
+    **Cooling COP:**
+
+    .. math::
+        COP_{cool}(h) = \eta_{carnot,cool} \times \frac{T_{supply,cool\_K}}{T_{outdoor\_K}(h) - T_{supply,cool\_K}}
+
+    Both require positive temperature differences to avoid division by zero.
+
+    :param heat_supply_temperature: Heat pump supply temperature for heating mode (°C). \
+        Typical: 30-40°C for underfloor, 50-70°C for radiators.
+    :type heat_supply_temperature: float
+    :param cool_supply_temperature: Heat pump supply temperature for cooling mode (°C). \
+        Typical: 8-15°C for chilled water systems.
+    :type cool_supply_temperature: float
+    :param heat_carnot_efficiency: Real-world efficiency factor for heating (0-1). \
+        Typical: 0.35-0.50.
+    :type heat_carnot_efficiency: float
+    :param cool_carnot_efficiency: Real-world efficiency factor for cooling (0-1). \
+        Typical: 0.35-0.50.
+    :type cool_carnot_efficiency: float
+    :param outdoor_temperature_forecast: Array of outdoor temperature forecasts (°C).
+    :type outdoor_temperature_forecast: np.ndarray or pd.Series
+    :return: Tuple of (heating_cop_array, cooling_cop_array), each same length as input.
+    :rtype: tuple[np.ndarray, np.ndarray]
+
+    Example:
+        >>> heat_supply = 35.0  # °C
+        >>> cool_supply = 12.0  # °C
+        >>> heat_eff = 0.4
+        >>> cool_eff = 0.45
+        >>> outdoor_temps = np.array([0.0, 10.0, 20.0, 30.0])
+        >>> heat_cops, cool_cops = calculate_cop_dual_mode(
+        ...     heat_supply, cool_supply, heat_eff, cool_eff, outdoor_temps
+        ... )
+        >>> heat_cops
+        array([3.521..., 4.926..., 8.217..., ...])
+        >>> cool_cops
+        array([...])
+
+    """
+    # Convert to numpy array if pandas Series
+    if isinstance(outdoor_temperature_forecast, pd.Series):
+        outdoor_temps = outdoor_temperature_forecast.values
+    else:
+        outdoor_temps = np.asarray(outdoor_temperature_forecast)
+
+    # Convert temperatures to Kelvin
+    heat_supply_kelvin = heat_supply_temperature + 273.15
+    cool_supply_kelvin = cool_supply_temperature + 273.15
+    outdoor_kelvin = outdoor_temps + 273.15
+
+    # Calculate heating COP
+    # COP_heat = efficiency * T_supply / (T_supply - T_outdoor)
+    heat_temp_diff = heat_supply_kelvin - outdoor_kelvin
+    heat_cop = np.ones_like(outdoor_kelvin)  # Default to 1.0
+    valid_heat = heat_temp_diff > 0
+
+    if np.any(valid_heat):
+        heat_cop[valid_heat] = (
+            heat_carnot_efficiency * heat_supply_kelvin / heat_temp_diff[valid_heat]
+        )
+
+    # Log warning for non-physical heating scenarios
+    if np.any(~valid_heat):
+        logger = logging.getLogger(__name__)
+        num_invalid = np.sum(~valid_heat)
+        logger.warning(
+            f"Dual-mode COP: {num_invalid} timestep(s) have outdoor temperature >= "
+            f"heat supply temperature ({heat_supply_temperature:.1f}°C). "
+            f"Setting COP to 1.0 (direct heating) for these periods."
+        )
+
+    heat_cop = np.clip(heat_cop, 1.0, 8.0)
+
+    # Calculate cooling COP
+    # COP_cool = efficiency * T_supply / (T_outdoor - T_supply)
+    cool_temp_diff = outdoor_kelvin - cool_supply_kelvin
+    cool_cop = np.ones_like(outdoor_kelvin)  # Default to 1.0
+    valid_cool = cool_temp_diff > 0
+
+    if np.any(valid_cool):
+        cool_cop[valid_cool] = (
+            cool_carnot_efficiency * cool_supply_kelvin / cool_temp_diff[valid_cool]
+        )
+
+    # Log warning for non-physical cooling scenarios
+    if np.any(~valid_cool):
+        logger = logging.getLogger(__name__)
+        num_invalid = np.sum(~valid_cool)
+        logger.warning(
+            f"Dual-mode COP: {num_invalid} timestep(s) have outdoor temperature <= "
+            f"cool supply temperature ({cool_supply_temperature:.1f}°C). "
+            f"Setting COP to 1.0 (direct cooling) for these periods."
+        )
+
+    cool_cop = np.clip(cool_cop, 1.0, 10.0)
+
+    return heat_cop, cool_cop
+
+
+def calculate_dual_thermal_demand(
+    u_value: float,
+    envelope_area: float,
+    ventilation_rate: float,
+    heated_volume: float,
+    indoor_target_temperature: float,
+    outdoor_temperature_forecast: np.ndarray | pd.Series,
+    optimization_time_step: int,
+    solar_irradiance_forecast: np.ndarray | pd.Series | None = None,
+    window_area: float | None = None,
+    shgc: float = 0.6,
+    internal_gains_forecast: np.ndarray | pd.Series | None = None,
+    internal_gains_factor: float = 0.0,
+) -> dict[str, np.ndarray]:
+    r"""
+    Calculate net thermal demand using a unified energy-balance approach.
+
+    The net thermal load at each timestep is computed as a single signed quantity:
+
+    .. math::
+        \text{net} = (U \cdot A + \dot{V} \cdot \rho \cdot c_p) \cdot (T_{indoor} - T_{outdoor})
+                     - P_{solar} - P_{internal}
+
+    where positive net means heat is leaving the building (heating needed) and negative
+    net means heat is entering the building (cooling needed).  Solar and internal gains
+    always act to reduce heating demand and increase cooling demand regardless of which
+    direction the temperature difference falls.
+
+    The signed thermal balance returned is:
+
+    .. math::
+        \text{thermal\_balance} = -\text{net}
+
+    so ``thermal_balance > 0`` ↔ cooling need, ``thermal_balance < 0`` ↔ heating need.
+
+    :param u_value: Thermal transmittance of envelope (W/m²K)
+    :type u_value: float
+    :param envelope_area: Total envelope surface area (m²)
+    :type envelope_area: float
+    :param ventilation_rate: Ventilation air changes per hour (h⁻¹)
+    :type ventilation_rate: float
+    :param heated_volume: Building volume (m³)
+    :type heated_volume: float
+    :param indoor_target_temperature: Target/desired indoor temperature (°C)
+    :type indoor_target_temperature: float
+    :param outdoor_temperature_forecast: Outdoor temperature forecast (°C), one per timestep
+    :type outdoor_temperature_forecast: np.ndarray or pd.Series
+    :param optimization_time_step: Optimization timestep duration (minutes)
+    :type optimization_time_step: int
+    :param solar_irradiance_forecast: Solar irradiance forecast (W/m²), optional
+    :type solar_irradiance_forecast: np.ndarray | pd.Series | None, optional
+    :param window_area: Total window area (m²), needed if solar_irradiance provided
+    :type window_area: float | None, optional
+    :param shgc: Solar Heat Gain Coefficient (0-1), defaults to 0.6
+    :type shgc: float, optional
+    :param internal_gains_forecast: Internal heat gains forecast (W), optional
+    :type internal_gains_forecast: np.ndarray | pd.Series | None, optional
+    :param internal_gains_factor: Scaling factor for internal gains (0-1), defaults to 0.0
+    :type internal_gains_factor: float, optional
+    :return: Dictionary with keys: "heating_load_kwh", "cooling_load_kwh", "solar_gains_kwh", \
+        "internal_gains_kwh", "thermal_balance_kwh" (positive = cooling need, negative = heating need)
+    :rtype: dict[str, np.ndarray]
+
+    """
+    # Convert outdoor temperature to numpy array
+    if isinstance(outdoor_temperature_forecast, pd.Series):
+        outdoor_temps = outdoor_temperature_forecast.values
+    else:
+        outdoor_temps = np.asarray(outdoor_temperature_forecast)
+
+    # Signed temperature difference: positive = indoor warmer than outdoor (heat leaving)
+    temp_diff = indoor_target_temperature - outdoor_temps
+
+    # Combined heat-transfer coefficient (kW/K)
+    # Transmission: U·A [W/K] / 1000
+    # Ventilation: ACH × V × ρ_air × cp_air [W/K] / 1000
+    air_density = 1.2  # kg/m³
+    air_heat_capacity = 1.005  # kJ/(kg·K)
+    ua_total_kw_per_k = (
+        u_value * envelope_area / 1000.0
+        + ventilation_rate * heated_volume * air_density * air_heat_capacity / 3600.0
+    )
+
+    # Net envelope heat flow (kW): positive = heat leaving building (cold outside)
+    envelope_load_kw = ua_total_kw_per_k * temp_diff
+
+    # Solar gains (kW) — always heat entering the building
+    solar_gains_kw = np.zeros_like(outdoor_temps)
+    if solar_irradiance_forecast is not None and window_area is not None:
+        if isinstance(solar_irradiance_forecast, pd.Series):
+            solar_irradiance = solar_irradiance_forecast.values
+        else:
+            solar_irradiance = np.asarray(solar_irradiance_forecast)
+        solar_irradiance = solar_irradiance.reshape(-1)
+        # Window projection factor accounts for window orientation variability
+        window_projection_factor = 0.3
+        solar_gains_kw = window_area * shgc * solar_irradiance * window_projection_factor / 1000.0
+
+    # Internal gains (kW) — always heat entering the building
+    internal_gains_kw = np.zeros_like(outdoor_temps)
+    if internal_gains_forecast is not None and internal_gains_factor > 0:
+        if isinstance(internal_gains_forecast, pd.Series):
+            internal_gains = internal_gains_forecast.values
+        else:
+            internal_gains = np.asarray(internal_gains_forecast)
+        internal_gains = internal_gains.reshape(-1)
+        internal_gains_kw = internal_gains * internal_gains_factor / 1000.0
+
+    # Net thermal load (kW): positive = heating needed, negative = cooling needed
+    # Solar and internal gains reduce heating need / increase cooling need regardless of
+    # which side of the temperature setpoint the outdoor temperature sits.
+    net_load_kw = envelope_load_kw - solar_gains_kw - internal_gains_kw
+
+    # Convert to kWh
+    hours = optimization_time_step / 60.0
+    net_load_kwh = net_load_kw * hours
+    solar_gains_kwh = solar_gains_kw * hours
+    internal_gains_kwh = internal_gains_kw * hours
+
+    # Retain legacy envelope-only load keys (without gains) for callers that inspect them
+    heating_load_kwh = np.maximum(envelope_load_kw, 0.0) * hours
+    cooling_load_kwh = np.maximum(-envelope_load_kw, 0.0) * hours
+
+    # Signed thermal balance: positive = cooling need, negative = heating need
+    thermal_balance_kwh = -net_load_kwh
+
+    return {
+        "heating_load_kwh": heating_load_kwh,
+        "cooling_load_kwh": cooling_load_kwh,
+        "solar_gains_kwh": solar_gains_kwh,
+        "internal_gains_kwh": internal_gains_kwh,
+        "thermal_balance_kwh": thermal_balance_kwh,
+    }
+
+
 def calculate_thermal_loss_signed(
     outdoor_temperature_forecast: np.ndarray | pd.Series,
     indoor_temperature: float,
@@ -360,9 +614,47 @@ def calculate_heating_demand_physics(
     """
     Calculate heating demand per timestep based on building physics heat loss model.
 
+    This wrapper preserves the historical return type while delegating the actual
+    heat-balance decomposition to
+    [`calculate_heating_demand_physics_components()`](src/emhass/utils.py:521).
+    """
+    balance = calculate_heating_demand_physics_components(
+        u_value=u_value,
+        envelope_area=envelope_area,
+        ventilation_rate=ventilation_rate,
+        heated_volume=heated_volume,
+        indoor_target_temperature=indoor_target_temperature,
+        outdoor_temperature_forecast=outdoor_temperature_forecast,
+        optimization_time_step=optimization_time_step,
+        solar_irradiance_forecast=solar_irradiance_forecast,
+        window_area=window_area,
+        shgc=shgc,
+        internal_gains_forecast=internal_gains_forecast,
+        internal_gains_factor=internal_gains_factor,
+    )
+    return balance["heating_demand_kwh"]
+
+
+def calculate_heating_demand_physics_components(
+    u_value: float,
+    envelope_area: float,
+    ventilation_rate: float,
+    heated_volume: float,
+    indoor_target_temperature: float,
+    outdoor_temperature_forecast: np.ndarray | pd.Series,
+    optimization_time_step: int,
+    solar_irradiance_forecast: np.ndarray | pd.Series | None = None,
+    window_area: float | None = None,
+    shgc: float = 0.6,
+    internal_gains_forecast: np.ndarray | pd.Series | None = None,
+    internal_gains_factor: float = 0.0,
+) -> dict[str, np.ndarray]:
+    """
+    Calculate physics-based heating balance components per timestep.
+
     More accurate than HDD method as it directly calculates transmission and ventilation
     losses based on building thermal properties. Optionally accounts for solar gains
-    through windows to reduce heating demand.
+    through windows and internal gains from electrical loads.
 
     :param u_value: Overall thermal transmittance (U-value) in W/(m²·K). Typical values:
         - 0.2-0.3: Well-insulated modern building
@@ -385,10 +677,12 @@ def calculate_heating_demand_physics(
     :param optimization_time_step: Optimization time step in minutes
     :type optimization_time_step: int
     :param solar_irradiance_forecast: Global Horizontal Irradiance (GHI) in W/m² for each timestep.
-        If provided along with window_area, solar gains will be subtracted from heating demand.
+        If provided along with window_area, solar gains will be subtracted from heating demand
+        and may drive the residual demand negative when passive gains exceed losses.
     :type solar_irradiance_forecast: np.ndarray | pd.Series | None, optional
     :param window_area: Total window area in m². If provided along with solar_irradiance_forecast,
-        solar gains will reduce heating demand. Typical values: 15-25% of floor area.
+        solar gains will reduce heating demand and may produce negative residual demand.
+        Typical values: 15-25% of floor area.
     :type window_area: float | None, optional
     :param shgc: Solar Heat Gain Coefficient (dimensionless, 0-1). Fraction of solar radiation
         that becomes heat inside the building. Typical values:
@@ -399,7 +693,8 @@ def calculate_heating_demand_physics(
     :type shgc: float, optional
     :param internal_gains_forecast: Electrical load power forecast in W for each timestep.
         If provided along with internal_gains_factor > 0, internal gains from electrical
-        appliances will be subtracted from heating demand.
+        appliances will be subtracted from heating demand and may produce negative residual
+        demand when gains exceed losses.
     :type internal_gains_forecast: np.ndarray | pd.Series | None, optional
     :param internal_gains_factor: Factor (0-1) representing what fraction of electrical load
         becomes useful internal heat gains. Typical values:
@@ -409,13 +704,15 @@ def calculate_heating_demand_physics(
         - 1.0: All electrical energy becomes internal heat (theoretical maximum)
         Default: 0.0
     :type internal_gains_factor: float, optional
-    :return: Array of heating demand values (kWh) per timestep
-    :rtype: np.ndarray
+    :return: Dictionary containing component arrays in kWh per timestep:
+        `heat_loss_kwh`, `solar_gains_kwh`, `internal_gains_kwh`,
+        and signed `heating_demand_kwh`.
+    :rtype: dict[str, np.ndarray]
 
     Example:
         >>> outdoor_temps = np.array([5, 8, 12, 15])
         >>> ghi = np.array([0, 100, 400, 600])  # W/m²
-        >>> demand = calculate_heating_demand_physics(
+        >>> balance = calculate_heating_demand_physics_components(
         ...     u_value=0.3,
         ...     envelope_area=400,
         ...     ventilation_rate=0.5,
@@ -427,6 +724,7 @@ def calculate_heating_demand_physics(
         ...     window_area=50,
         ...     shgc=0.6
         ... )
+        >>> demand = balance["heating_demand_kwh"]
     """
 
     # Convert outdoor temperature forecast to numpy array if pandas Series
@@ -451,8 +749,10 @@ def calculate_heating_demand_physics(
         ventilation_rate * heated_volume * air_density * air_heat_capacity * temp_diff / 3600.0
     )
 
-    # Total heat loss in kW
+    # Total heat loss in kW before gains
     total_loss_kw = transmission_loss_kw + ventilation_loss_kw
+
+    solar_gains_kw = np.zeros_like(total_loss_kw)
 
     # Calculate solar gains if irradiance and window area are provided
     if solar_irradiance_forecast is not None and window_area is not None:
@@ -462,19 +762,33 @@ def calculate_heating_demand_physics(
             if isinstance(solar_irradiance_forecast, pd.Series)
             else np.asarray(solar_irradiance_forecast)
         )
+        solar_irradiance = np.asarray(solar_irradiance).reshape(-1)
+        if len(solar_irradiance) != len(outdoor_temps):
+            raise ValueError(
+                f"solar_irradiance_forecast length ({len(solar_irradiance)}) must match "
+                f"outdoor_temperature_forecast length ({len(outdoor_temps)})"
+            )
 
-        # Solar gains: Q_solar = window_area * SHGC * GHI (W to kW)
-        # GHI is in W/m², so multiply by window_area (m²) gives W, then divide by 1000 for kW
-        solar_gains_kw = window_area * shgc * solar_irradiance / 1000.0
-
-        # Subtract solar gains from heat loss (but never go negative)
-        total_loss_kw = np.maximum(total_loss_kw - solar_gains_kw, 0.0)
+        # Solar gains: use a conservative projection from horizontal GHI to effective
+        # heat through building windows.
+        #
+        # The forecast input is GHI on a horizontal plane, while windows are typically
+        # vertical and subject to orientation, frame, incidence-angle and shading losses.
+        # Using raw GHI directly tends to overestimate passive gains for thermal-battery
+        # control and can make strict comfort-bounded MPC cases unrealistically overheat.
+        #
+        # A fixed projection factor keeps the model simple while avoiding raw-GHI
+        # overestimation.
+        window_projection_factor = 0.3
+        solar_gains_kw = window_area * shgc * solar_irradiance * window_projection_factor / 1000.0
 
     # Validate internal_gains_factor is in expected range [0, 1]
     if internal_gains_factor < 0 or internal_gains_factor > 1:
         raise ValueError(
             f"internal_gains_factor must be between 0 and 1, got {internal_gains_factor}"
         )
+
+    internal_gains_kw = np.zeros_like(total_loss_kw)
 
     # Calculate internal gains from electrical load if provided and applicable
     if internal_gains_forecast is not None and internal_gains_factor > 0:
@@ -512,12 +826,290 @@ def calculate_heating_demand_physics(
         # load_power is in W, convert to kW; factor is dimensionless (0-1)
         internal_gains_kw = internal_gains * internal_gains_factor / W_TO_KW
 
-        # Subtract internal gains from heat loss (but never go negative)
-        total_loss_kw = np.maximum(total_loss_kw - internal_gains_kw, 0.0)
+    net_heating_demand_kw = total_loss_kw - solar_gains_kw - internal_gains_kw
 
     # Convert to kWh for the timestep
     hours_per_timestep = optimization_time_step / 60.0
-    return total_loss_kw * hours_per_timestep
+    return {
+        "heat_loss_kwh": total_loss_kw * hours_per_timestep,
+        "solar_gains_kwh": solar_gains_kw * hours_per_timestep,
+        "internal_gains_kwh": internal_gains_kw * hours_per_timestep,
+        "heating_demand_kwh": net_heating_demand_kw * hours_per_timestep,
+    }
+
+
+def calculate_thermal_balance(
+    u_value: float,
+    envelope_area: float,
+    ventilation_rate: float,
+    heated_volume: float,
+    indoor_target_temperature: float,
+    outdoor_temperature_forecast: np.ndarray | pd.Series,
+    optimization_time_step: int,
+    solar_irradiance_forecast: np.ndarray | pd.Series | None = None,
+    window_area: float | None = None,
+    shgc: float = 0.6,
+    internal_gains_forecast: np.ndarray | pd.Series | None = None,
+    internal_gains_factor: float = 0.0,
+) -> dict[str, np.ndarray]:
+    """
+    Calculate signed thermal balance where positive values indicate heating demand
+    and negative values indicate cooling demand.
+
+    This function provides a unified approach to thermal modeling by using a single
+    signed value to represent the building's thermal state:
+
+    - **Positive Balance**: Building is losing heat to the environment, heating required
+    - **Negative Balance**: Building is gaining heat from the environment, cooling required
+    - **Zero Balance**: Building is in thermal equilibrium, no action required
+
+    The thermal balance is calculated based on:
+    1. Temperature difference between indoors and outdoors (conductive/convective heat flow)
+    2. Solar gains through windows
+    3. Internal heat gains from electrical loads
+
+    :param u_value: Overall thermal transmittance (U-value) in W/(m²·K)
+    :type u_value: float
+    :param envelope_area: Total building envelope area in m²
+    :type envelope_area: float
+    :param ventilation_rate: Air changes per hour (ACH)
+    :type ventilation_rate: float
+    :param heated_volume: Total heated volume in m³
+    :type heated_volume: float
+    :param indoor_target_temperature: Target indoor temperature in °C
+    :type indoor_target_temperature: float
+    :param outdoor_temperature_forecast: Outdoor temperature forecast in °C for each timestep
+    :type outdoor_temperature_forecast: np.ndarray | pd.Series
+    :param optimization_time_step: Optimization time step in minutes
+    :type optimization_time_step: int
+    :param solar_irradiance_forecast: Global Horizontal Irradiance (GHI) in W/m² for each timestep
+    :type solar_irradiance_forecast: np.ndarray | pd.Series | None, optional
+    :param window_area: Total window area in m²
+    :type window_area: float | None, optional
+    :param shgc: Solar Heat Gain Coefficient (0-1)
+    :type shgc: float, optional
+    :param internal_gains_forecast: Electrical load power forecast in W for each timestep
+    :type internal_gains_forecast: np.ndarray | pd.Series | None, optional
+    :param internal_gains_factor: Factor (0-1) representing what fraction of electrical load
+        becomes useful internal heat gains
+    :type internal_gains_factor: float, optional
+    :return: Dictionary containing component arrays in kWh per timestep:
+        `thermal_load_kwh` (conductive/convective load),
+        `solar_gains_kwh`, `internal_gains_kwh`,
+        and signed `thermal_balance_kwh`.
+    :rtype: dict[str, np.ndarray]
+
+    Example:
+        >>> outdoor_temps = np.array([5, 15, 25, 35])  # Mix of heating and cooling conditions
+        >>> ghi = np.array([0, 200, 600, 1000])  # W/m²
+        >>> balance = calculate_thermal_balance(
+        ...     u_value=0.3,
+        ...     envelope_area=400,
+        ...     ventilation_rate=0.5,
+        ...     heated_volume=250,
+        ...     indoor_target_temperature=22,
+        ...     outdoor_temperature_forecast=outdoor_temps,
+        ...     optimization_time_step=30,
+        ...     solar_irradiance_forecast=ghi,
+        ...     window_area=50,
+        ...     shgc=0.6
+        ... )
+        >>> balance["thermal_balance_kwh"]  # Positive for heating, negative for cooling
+    """
+    # Convert outdoor temperature forecast to numpy array if pandas Series
+    outdoor_temps = (
+        outdoor_temperature_forecast.values
+        if isinstance(outdoor_temperature_forecast, pd.Series)
+        else np.asarray(outdoor_temperature_forecast)
+    )
+
+    # Calculate SIGNED temperature difference (indoor - outdoor)
+    # Positive: indoor > outdoor → heat flows out, heating needed
+    # Negative: outdoor > indoor → heat flows in, cooling needed
+    temp_diff = indoor_target_temperature - outdoor_temps
+
+    # Transmission thermal load: Q_trans = U * A * ΔT (W to kW)
+    transmission_load_kw = u_value * envelope_area * temp_diff / 1000.0
+
+    # Ventilation thermal load: Q_vent = V * ρ * c * n * ΔT / 3600
+    air_density = 1.2  # kg/m³ at 20°C
+    air_heat_capacity = 1.005  # kJ/(kg·K)
+    ventilation_load_kw = (
+        ventilation_rate * heated_volume * air_density * air_heat_capacity * temp_diff / 3600.0
+    )
+
+    # Total thermal load in kW (signed: positive = heating, negative = cooling)
+    thermal_load_kw = transmission_load_kw + ventilation_load_kw
+
+    # Solar gains calculation (kW)
+    solar_gains_kw = np.zeros_like(outdoor_temps)
+    if solar_irradiance_forecast is not None and window_area is not None:
+        solar_irradiance = (
+            solar_irradiance_forecast.values
+            if isinstance(solar_irradiance_forecast, pd.Series)
+            else np.asarray(solar_irradiance_forecast)
+        )
+        solar_irradiance = np.asarray(solar_irradiance).reshape(-1)
+
+        # Validate solar irradiance length
+        if len(solar_irradiance) != len(outdoor_temps):
+            raise ValueError(
+                f"solar_irradiance_forecast length ({len(solar_irradiance)}) must match "
+                f"outdoor_temperature_forecast length ({len(outdoor_temps)})"
+            )
+
+        # Window projection factor accounts for orientation effects
+        window_projection_factor = 0.3
+        solar_gains_kw = window_area * shgc * solar_irradiance * window_projection_factor / 1000.0
+
+    # Internal gains calculation (kW)
+    internal_gains_kw = np.zeros_like(outdoor_temps)
+    if internal_gains_forecast is not None and internal_gains_factor > 0:
+        # Validate internal_gains_factor range
+        if internal_gains_factor < 0 or internal_gains_factor > 1:
+            raise ValueError(
+                f"internal_gains_factor must be between 0 and 1, got {internal_gains_factor}"
+            )
+
+        internal_gains = (
+            internal_gains_forecast.values
+            if isinstance(internal_gains_forecast, pd.Series)
+            else internal_gains_forecast
+        )
+        internal_gains = np.asarray(internal_gains).reshape(-1)
+
+        # Validate internal gains forecast length
+        if len(internal_gains) != len(outdoor_temps):
+            raise ValueError(
+                f"internal_gains_forecast length ({len(internal_gains)}) must match "
+                f"outdoor_temperature_forecast length ({len(outdoor_temps)})"
+            )
+
+        # Check for potential unit error (likely kW instead of W)
+        max_load = np.max(internal_gains)
+        if max_load > 0 and max_load < 10:
+            import warnings
+
+            warnings.warn(
+                f"internal_gains_forecast max value ({max_load:.2f}) is very low. "
+                "Expected values in W (e.g., 500-5000), but received values that "
+                "look like kW. Please ensure you're passing Watts, not kilowatts.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        internal_gains_kw = internal_gains * internal_gains_factor / W_TO_KW
+
+    # Convert to kWh based on optimization timestep
+    hours_per_timestep = optimization_time_step / 60.0
+    thermal_load_kwh = thermal_load_kw * hours_per_timestep
+    solar_gains_kwh = solar_gains_kw * hours_per_timestep
+    internal_gains_kwh = internal_gains_kw * hours_per_timestep
+
+    # Calculate net thermal balance (signed value)
+    # Solar and internal gains always reduce heating need or increase cooling need
+    thermal_balance_kwh = thermal_load_kwh - solar_gains_kwh - internal_gains_kwh
+
+    return {
+        "thermal_balance_kwh": thermal_balance_kwh,
+        "thermal_load_kwh": thermal_load_kwh,
+        "solar_gains_kwh": solar_gains_kwh,
+        "internal_gains_kwh": internal_gains_kwh,
+    }
+
+
+def calculate_unified_cop(
+    thermal_balance: np.ndarray,
+    outdoor_temperature: np.ndarray | pd.Series,
+    heat_supply_temperature: float = 35.0,
+    cool_supply_temperature: float = 12.0,
+    heat_carnot_efficiency: float = 0.4,
+    cool_carnot_efficiency: float = 0.45,
+) -> np.ndarray:
+    """
+    Calculate heat pump Coefficient of Performance (COP) based on thermal balance sign.
+
+    This function provides a unified approach to COP calculation for heat pumps:
+    - When thermal_balance > 0: Heating COP is calculated and applied
+    - When thermal_balance < 0: Cooling COP is calculated and applied
+    - When thermal_balance = 0: COP is set to 1.0 (equivalent to direct electric heating/cooling)
+
+    The COP calculations are based on the Carnot efficiency:
+    - Heating COP = η_carnot × T_supply_K / (T_supply_K - T_outdoor_K)
+    - Cooling COP = η_carnot × T_supply_K / (T_outdoor_K - T_supply_K)
+
+    :param thermal_balance: Thermal balance array (positive=heating, negative=cooling)
+    :type thermal_balance: np.ndarray
+    :param outdoor_temperature: Outdoor temperature forecast in °C
+    :type outdoor_temperature: np.ndarray | pd.Series
+    :param heat_supply_temperature: Heat pump supply temperature for heating in °C (typical: 30-50°C)
+    :type heat_supply_temperature: float, optional
+    :param cool_supply_temperature: Heat pump supply temperature for cooling in °C (typical: 7-18°C)
+    :type cool_supply_temperature: float, optional
+    :param heat_carnot_efficiency: Carnot efficiency factor for heating mode (typical: 0.35-0.45)
+    :type heat_carnot_efficiency: float, optional
+    :param cool_carnot_efficiency: Carnot efficiency factor for cooling mode (typical: 0.35-0.50)
+    :type cool_carnot_efficiency: float, optional
+    :return: Array of COP values based on the sign of thermal balance
+    :rtype: np.ndarray
+
+    Example:
+        >>> thermal_balance = np.array([2.0, 1.0, -1.0, -2.0])  # kWh, mix of heating and cooling
+        >>> outdoor_temps = np.array([5.0, 10.0, 25.0, 35.0])  # °C
+        >>> cops = calculate_unified_cop(
+        ...     thermal_balance=thermal_balance,
+        ...     outdoor_temperature=outdoor_temps,
+        ...     heat_supply_temperature=35.0,
+        ...     cool_supply_temperature=12.0
+        ... )
+    """
+    # Convert outdoor temperature to numpy array if pandas Series
+    if isinstance(outdoor_temperature, pd.Series):
+        outdoor_temps = outdoor_temperature.values
+    else:
+        outdoor_temps = np.asarray(outdoor_temperature)
+
+    # Ensure thermal_balance is a numpy array
+    thermal_balance = np.asarray(thermal_balance)
+
+    # Check that arrays have the same shape
+    if outdoor_temps.shape != thermal_balance.shape:
+        raise ValueError(
+            f"outdoor_temperature shape ({outdoor_temps.shape}) must match "
+            f"thermal_balance shape ({thermal_balance.shape})"
+        )
+
+    # Convert temperatures to Kelvin
+    heat_supply_k = heat_supply_temperature + 273.15
+    cool_supply_k = cool_supply_temperature + 273.15
+    outdoor_k = outdoor_temps + 273.15
+
+    # Initialize COP array with 1.0 (equivalent to direct electric heating/cooling)
+    cop_values = np.ones_like(thermal_balance, dtype=float)
+
+    # Calculate heating COP for positive thermal balance (heating demand)
+    heat_mask = thermal_balance > 0
+    cool_mask = thermal_balance < 0
+
+    # Heating: valid only where supply temperature is above outdoor (heat flows from outdoors into supply)
+    heat_valid_mask = heat_mask & ((heat_supply_k - outdoor_k) > 0)
+    if np.any(heat_valid_mask):
+        heat_temp_diff = heat_supply_k - outdoor_k[heat_valid_mask]
+        cop_values[heat_valid_mask] = heat_carnot_efficiency * heat_supply_k / heat_temp_diff
+
+    # Cooling: valid only where outdoor temperature is above supply (heat flows from building to outdoors)
+    cool_valid_mask = cool_mask & ((outdoor_k - cool_supply_k) > 0)
+    if np.any(cool_valid_mask):
+        cool_temp_diff = outdoor_k[cool_valid_mask] - cool_supply_k
+        cop_values[cool_valid_mask] = cool_carnot_efficiency * cool_supply_k / cool_temp_diff
+
+    # Apply realistic bounds to COP values
+    # For heating mode (typical range: 2-5)
+    cop_values[heat_mask] = np.clip(cop_values[heat_mask], 1.0, 8.0)
+    # For cooling mode (typical range: 2-7, can be higher than heating)
+    cop_values[cool_mask] = np.clip(cop_values[cool_mask], 1.0, 10.0)
+
+    return cop_values
 
 
 def update_params_with_ha_config(
@@ -645,6 +1237,9 @@ async def treat_runtimeparams(
     custom_deferrable_forecast_id = []
     custom_predicted_temperature_id = []
     custom_heating_demand_id = []
+    custom_solar_gain_id = []
+    custom_thermal_balance_id = []
+    custom_thermal_mode_id = []
     for k in range(params["optim_conf"]["number_of_deferrable_loads"]):
         custom_deferrable_forecast_id.append(
             {
@@ -668,6 +1263,32 @@ async def treat_runtimeparams(
                 "device_class": "energy",
                 "unit_of_measurement": "kWh",
                 "friendly_name": f"Heating demand {k}",
+            }
+        )
+        custom_solar_gain_id.append(
+            {
+                "entity_id": f"sensor.solar_gain{k}",
+                "device_class": "energy",
+                "unit_of_measurement": "kWh",
+                "friendly_name": f"Solar gain {k}",
+            }
+        )
+        # Unified signed thermal balance (positive = cooling need, negative = heating need).
+        # Used for dual-mode loads; single-mode loads use custom_heating_demand_id above.
+        custom_thermal_balance_id.append(
+            {
+                "entity_id": f"sensor.thermal_balance{k}",
+                "device_class": "energy",
+                "unit_of_measurement": "kWh",
+                "friendly_name": f"Thermal balance {k}",
+            }
+        )
+        custom_thermal_mode_id.append(
+            {
+                "entity_id": f"sensor.thermal_mode_heater{k}",
+                "device_class": "enum",
+                "unit_of_measurement": "",
+                "friendly_name": f"Thermal Mode {k}",
             }
         )
     default_passed_dict = {
@@ -740,6 +1361,9 @@ async def treat_runtimeparams(
         "custom_deferrable_forecast_id": custom_deferrable_forecast_id,
         "custom_predicted_temperature_id": custom_predicted_temperature_id,
         "custom_heating_demand_id": custom_heating_demand_id,
+        "custom_thermal_balance_id": custom_thermal_balance_id,
+        "custom_solar_gain_id": custom_solar_gain_id,
+        "custom_thermal_mode_id": custom_thermal_mode_id,
         "publish_prefix": "",
     }
     if "passed_data" in params.keys():
@@ -928,33 +1552,45 @@ async def treat_runtimeparams(
             else:
                 prediction_horizon = runtimeparams["prediction_horizon"]
             params["passed_data"]["prediction_horizon"] = prediction_horizon
+            battery_soc_min = params["plant_conf"]["battery_minimum_state_of_charge"]
+            battery_soc_max = params["plant_conf"]["battery_maximum_state_of_charge"]
+
+            if "soc_min" in runtimeparams.keys():
+                battery_soc_min = runtimeparams["soc_min"]
+                params["plant_conf"]["battery_minimum_state_of_charge"] = battery_soc_min
+
+            if "battery_target_state_of_charge" in runtimeparams.keys():
+                params["plant_conf"]["battery_target_state_of_charge"] = runtimeparams[
+                    "battery_target_state_of_charge"
+                ]
+
             if "soc_init" not in runtimeparams.keys():
                 soc_init = params["plant_conf"]["battery_target_state_of_charge"]
             else:
                 soc_init = runtimeparams["soc_init"]
-            if soc_init < params["plant_conf"]["battery_minimum_state_of_charge"]:
+            if soc_init < battery_soc_min:
                 logger.warning(
-                    f"Passed soc_init={soc_init} is lower than soc_min={params['plant_conf']['battery_minimum_state_of_charge']}, keeping real initial SOC for optimization recovery"
+                    f"Passed soc_init={soc_init} is lower than soc_min={battery_soc_min}, keeping real initial SOC for optimization recovery"
                 )
-            if soc_init > params["plant_conf"]["battery_maximum_state_of_charge"]:
+            if soc_init > battery_soc_max:
                 logger.warning(
-                    f"Passed soc_init={soc_init} is greater than soc_max={params['plant_conf']['battery_maximum_state_of_charge']}, keeping real initial SOC for optimization recovery"
+                    f"Passed soc_init={soc_init} is greater than soc_max={battery_soc_max}, keeping real initial SOC for optimization recovery"
                 )
             params["passed_data"]["soc_init"] = soc_init
             if "soc_final" not in runtimeparams.keys():
                 soc_final = params["plant_conf"]["battery_target_state_of_charge"]
             else:
                 soc_final = runtimeparams["soc_final"]
-            if soc_final < params["plant_conf"]["battery_minimum_state_of_charge"]:
+            if soc_final < battery_soc_min:
                 logger.warning(
-                    f"Passed soc_final={soc_final} is lower than soc_min={params['plant_conf']['battery_minimum_state_of_charge']}, setting soc_final=soc_min"
+                    f"Passed soc_final={soc_final} is lower than soc_min={battery_soc_min}, setting soc_final=soc_min"
                 )
-                soc_final = params["plant_conf"]["battery_minimum_state_of_charge"]
-            if soc_final > params["plant_conf"]["battery_maximum_state_of_charge"]:
+                soc_final = battery_soc_min
+            if soc_final > battery_soc_max:
                 logger.warning(
-                    f"Passed soc_final={soc_final} is greater than soc_max={params['plant_conf']['battery_maximum_state_of_charge']}, setting soc_final=soc_max"
+                    f"Passed soc_final={soc_final} is greater than soc_max={battery_soc_max}, setting soc_final=soc_max"
                 )
-                soc_final = params["plant_conf"]["battery_maximum_state_of_charge"]
+                soc_final = battery_soc_max
             params["passed_data"]["soc_final"] = soc_final
             if "operating_timesteps_of_each_deferrable_load" in runtimeparams.keys():
                 params["passed_data"]["operating_timesteps_of_each_deferrable_load"] = (
@@ -1012,6 +1648,7 @@ async def treat_runtimeparams(
             "load_cost_forecast",
             "prod_price_forecast",
             "outdoor_temperature_forecast",
+            "ghi_forecast",
         ]
         forecast_methods = [
             "weather_forecast_method",
@@ -1019,6 +1656,7 @@ async def treat_runtimeparams(
             "load_cost_forecast_method",
             "production_price_forecast_method",
             "outdoor_temperature_forecast_method",
+            "ghi_forecast_method",
         ]
 
         # Loop forecasts, check if value is a list and greater than or equal to forecast_dates
@@ -1311,6 +1949,16 @@ async def treat_runtimeparams(
         if "custom_heating_demand_id" in runtimeparams.keys():
             params["passed_data"]["custom_heating_demand_id"] = runtimeparams[
                 "custom_heating_demand_id"
+            ]
+        if "custom_solar_gain_id" in runtimeparams.keys():
+            params["passed_data"]["custom_solar_gain_id"] = runtimeparams["custom_solar_gain_id"]
+        if "custom_thermal_balance_id" in runtimeparams.keys():
+            params["passed_data"]["custom_thermal_balance_id"] = runtimeparams[
+                "custom_thermal_balance_id"
+            ]
+        if "custom_thermal_mode_id" in runtimeparams.keys():
+            params["passed_data"]["custom_thermal_mode_id"] = runtimeparams[
+                "custom_thermal_mode_id"
             ]
 
     # split config categories from params
