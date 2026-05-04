@@ -10,7 +10,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       actions: read
       security-events: write
@@ -20,14 +20,13 @@ jobs:
       matrix:
         platform:
           [
-            { target_arch: amd64, buildx: "linux/amd64", os_version: debian },
-            { target_arch: aarch64, buildx: "linux/arm64", os_version: debian },
+            { target_arch: amd64,   buildx: "linux/amd64", os_version: debian, runner: ubuntu-latest },
+            { target_arch: aarch64, buildx: "linux/arm64", os_version: debian, runner: ubuntu-24.04-arm },
           ]
     steps:
+      # amd64 uses an x86-64 runner (native); aarch64 uses a native ARM64 runner (no QEMU needed)
       - name: Checkout the repository
         uses: actions/checkout@v4
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Build and push by digest
@@ -75,7 +74,7 @@ jobs:
       fail-on-vuln: false
       scan-args: |-
         --lockfile=dpkg-status:./${{ matrix.platform.target_arch }}.status
-        --lockfile=poetry.lock:./${{matrix.platform.target_arch }}.lock
+        --lockfile=uv:./${{matrix.platform.target_arch }}.lock
     permissions:
       actions: read
       security-events: write
