@@ -1230,6 +1230,18 @@ class RetrieveHass:
                 state,
                 decimals=4,
             )
+        elif type_var == "shadow_price":
+            data = RetrieveHass.get_attr_data_dict(
+                data_df,
+                idx,
+                entity_id,
+                device_class,
+                unit_of_measurement,
+                friendly_name,
+                "shadow_price_forecasts",
+                state,
+                decimals=4,
+            )
         elif type_var == "mlforecaster":
             data = RetrieveHass.get_attr_data_dict(
                 data_df,

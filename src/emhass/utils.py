@@ -1445,6 +1445,12 @@ async def treat_runtimeparams(
         _parse_power_limit("maximum_power_from_grid")
         _parse_power_limit("maximum_power_to_grid")
 
+        # Allow skipping shadow-price extraction for fast what-if runs
+        if "skip_shadow_price_extraction" in runtimeparams:
+            params["optim_conf"]["skip_shadow_price_extraction"] = runtimeparams[
+                "skip_shadow_price_extraction"
+            ]
+
         # Generate forecast_dates
         # Force update optimization_time_step if present in runtimeparams
         if "optimization_time_step" in runtimeparams:

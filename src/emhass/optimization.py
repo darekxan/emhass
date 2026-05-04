@@ -123,6 +123,7 @@ class Optimization:
         self.logger.debug(f"Optimization configuration: {optim_conf}")
         self.logger.debug(f"Plant configuration: {plant_conf}")
         self.logger.debug(f"Number of threads: {self.num_threads}")
+        self.logger.info(f"Installed CVXPY solvers: {cp.installed_solvers()}")
 
         # CVXPY Initialization
         # Calculate the fixed number of time steps (N)
@@ -1268,12 +1269,12 @@ class Optimization:
 
         # Main Power Balance Constraints
         if self.plant_conf["inverter_is_hybrid"]:
-            constraints.append(
+            self.power_balance_constraint = (
                 p_hybrid_inverter - p_def_sum - p_load + p_grid_neg + p_grid_pos == 0
             )
         else:
             if self.plant_conf["compute_curtailment"]:
-                constraints.append(
+                self.power_balance_constraint = (
                     p_pv
                     - p_pv_curtailment
                     - p_def_sum
@@ -1285,9 +1286,10 @@ class Optimization:
                     == 0
                 )
             else:
-                constraints.append(
+                self.power_balance_constraint = (
                     p_pv - p_def_sum - p_load + p_grid_neg + p_grid_pos + p_sto_pos + p_sto_neg == 0
                 )
+        constraints.append(self.power_balance_constraint)
 
         # Grid Constraints (Vectorized with Time-Varying Limits)
         # p_grid_pos <= max_from_grid[t] * D[t]
@@ -3167,6 +3169,10 @@ class Optimization:
                 q_values = get_val(q_input_var)
                 opt_tp[f"q_input_heater{k}"] = np.round(q_values, 4)
 
+        # Shadow prices (full horizon)
+        if hasattr(self, "shadow_prices") and self.shadow_prices is not None:
+            opt_tp["shadow_price"] = self.shadow_prices
+
         # Debug Columns
         if debug:
             for k in range(self.optim_conf["number_of_deferrable_loads"]):
@@ -3174,6 +3180,194 @@ class Optimization:
                 opt_tp[f"P_def_bin2_{k}"] = get_val(self.vars["p_def_bin2"][k])
 
         return opt_tp
+
+    def _extract_shadow_prices(self, selected_solver, solver_opts):
+        """Extract shadow prices using finite differences on a fixed LP.
+
+        Fixes all binary variables to their MILP-optimal values and solves
+        a pure continuous LP. Then perturbs the load forecast by a small
+        delta at each timestep, re-solves, and computes the marginal cost
+        from the objective change. This avoids dependence on dual values
+        which are not reliably populated by CVXPY/HiGHS for MILPs.
+        """
+        if self.prob.status not in [
+            cp.OPTIMAL,
+            cp.OPTIMAL_INACCURATE,
+            "Optimal (Relaxed)",
+        ]:
+            return None
+
+        # If the current problem already has valid duals (relaxed LP),
+        # read them directly.
+        if (
+            hasattr(self, "power_balance_constraint")
+            and self.power_balance_constraint.dual_value is not None
+        ):
+            duals = np.array(self.power_balance_constraint.dual_value)
+            return -duals * (1000.0 / self.time_step)
+
+        # --- Build fixed LP: fix all binary variables, relax to continuous ---
+        fix_constraints = []
+        original_attrs = {}  # var -> {"boolean": bool, "integer": bool}
+        value_snapshot = {}
+
+        def _snapshot_var_values():
+            def _copy_value(value):
+                return (
+                    None if value is None else np.copy(value) if hasattr(value, "copy") else value
+                )
+
+            for key, obj in self.vars.items():
+                if isinstance(obj, cp.Variable):
+                    value_snapshot[("vars", key)] = _copy_value(obj.value)
+                elif isinstance(obj, list):
+                    saved_list = []
+                    for item in obj:
+                        if isinstance(item, cp.Variable):
+                            saved_list.append(_copy_value(item.value))
+                        else:
+                            saved_list.append(None)
+                    value_snapshot[("vars", key)] = saved_list
+            for attr_name in ("predicted_temps", "q_inputs"):
+                attr = getattr(self, attr_name, {})
+                if isinstance(attr, dict):
+                    for key, obj in attr.items():
+                        if isinstance(obj, cp.Variable):
+                            value_snapshot[(attr_name, key)] = _copy_value(obj.value)
+
+        def _restore_shadow_price_state():
+            self.param_load_forecast.value = original_load
+            for var, attrs in original_attrs.items():
+                var.boolean = attrs["boolean"]
+                var.integer = attrs["integer"]
+            for (scope, key), saved in value_snapshot.items():
+                if scope == "vars":
+                    obj = self.vars.get(key)
+                    if isinstance(obj, cp.Variable):
+                        obj.value = saved
+                    elif isinstance(obj, list) and isinstance(saved, list):
+                        for idx, item in enumerate(obj):
+                            if isinstance(item, cp.Variable) and idx < len(saved):
+                                item.value = saved[idx]
+                else:
+                    attr = getattr(self, scope, {})
+                    obj = attr.get(key) if isinstance(attr, dict) else None
+                    if isinstance(obj, cp.Variable):
+                        obj.value = saved
+
+        def _relax_var(var):
+            """Store and strip boolean/integer attrs so solver sees a continuous var."""
+            if var is None:
+                return
+            original_attrs[var] = {
+                "boolean": getattr(var, "boolean", False),
+                "integer": getattr(var, "integer", False),
+            }
+            var.boolean = False
+            var.integer = False
+
+        original_load = np.array(self.param_load_forecast.value).copy()
+        _snapshot_var_values()
+
+        for var_name in ("D", "E"):
+            var = self.vars.get(var_name)
+            if var is not None and var.value is not None:
+                _relax_var(var)
+                fix_constraints.append(var == var.value)
+
+        n_def = self.optim_conf.get("number_of_deferrable_loads", 0)
+        for k in range(n_def):
+            for bin_name in ("p_def_bin1", "p_def_start", "p_def_bin2"):
+                bin_vars = self.vars.get(bin_name)
+                if bin_vars is not None and k < len(bin_vars) and bin_vars[k].value is not None:
+                    var = bin_vars[k]
+                    _relax_var(var)
+                    fix_constraints.append(var == var.value)
+
+        var = self.vars.get("is_dc_sourcing")
+        if var is not None and var.value is not None:
+            _relax_var(var)
+            fix_constraints.append(var == var.value)
+
+        for var_name in ("soc_low_recovered", "soc_high_recovered"):
+            var = self.vars.get(var_name)
+            if var is not None and var.value is not None:
+                _relax_var(var)
+                fix_constraints.append(var == var.value)
+
+        for k in range(n_def):
+            for var_name in (f"heat_active_{k}", f"cool_active_{k}"):
+                var = self.vars.get(var_name)
+                if var is not None and var.value is not None:
+                    _relax_var(var)
+                    fix_constraints.append(var == var.value)
+
+        fixed_constraints = list(self.all_constraints) + fix_constraints
+        fixed_lp = cp.Problem(self.objective_expr, fixed_constraints)
+
+        try:
+            fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
+        except Exception as e:
+            self.logger.warning(f"Fixed LP solve for shadow prices failed: {e}")
+            _restore_shadow_price_state()
+            return None
+
+        if fixed_lp.status not in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+            self.logger.warning(f"Fixed LP for shadow prices returned status: {fixed_lp.status}")
+            _restore_shadow_price_state()
+            return None
+
+        base_obj = fixed_lp.value
+        if base_obj is None:
+            _restore_shadow_price_state()
+            return None
+
+        # --- Finite-difference shadow prices ---
+        n = self.num_timesteps
+        DELTA_W = 10.0  # perturbation in Watts
+        shadow_prices = np.full(n, np.nan)
+
+        # Solve base fixed LP once more to warm-start the cache
+        self.param_load_forecast.value = original_load
+        try:
+            fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
+        except Exception:
+            pass
+
+        for i in range(n):
+            perturbed_load = original_load.copy()
+            perturbed_load[i] += DELTA_W
+            self.param_load_forecast.value = perturbed_load
+
+            try:
+                fixed_lp.solve(solver=selected_solver, warm_start=True, **solver_opts)
+                if (
+                    fixed_lp.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]
+                    and fixed_lp.value is not None
+                ):
+                    delta_obj = fixed_lp.value - base_obj
+                    # Convert objective delta to PLN/kWh
+                    # delta_obj is in PLN per optimization step (time_step hours)
+                    # Shadow price = (delta_obj / (DELTA_W * time_step)) * 1000 W/kW
+                    shadow_prices[i] = -delta_obj * (1000.0 / (DELTA_W * self.time_step))
+                else:
+                    self.logger.debug(
+                        f"Shadow price perturbed solve failed at t={i}: {fixed_lp.status}"
+                    )
+            except Exception as e:
+                self.logger.debug(f"Shadow price perturbed solve crashed at t={i}: {e}")
+
+        _restore_shadow_price_state()
+
+        if np.isnan(shadow_prices).all():
+            return None
+        finite = np.isfinite(shadow_prices)
+        if not finite.all():
+            positions = np.arange(n)
+            shadow_prices[~finite] = np.interp(
+                positions[~finite], positions[finite], shadow_prices[finite]
+            )
+        return shadow_prices
 
     def perform_optimization(
         self,
@@ -3222,6 +3416,7 @@ class Optimization:
 
             # Force problem rebuild
             self.prob = None
+            self.shadow_prices = None
 
         # Netting-window wall-clock alignment: compute how many head timesteps fall
         # before the first complete window boundary anchored at 00:00.
@@ -3470,6 +3665,7 @@ class Optimization:
 
         # Build Problem (Lazy Construction)
         if self.prob is None:
+            self.shadow_prices = None
             self.logger.info("Building CVXPY problem structure...")
 
             # Start with bound constraints
@@ -3544,6 +3740,8 @@ class Optimization:
                 objective_expr.args[0] += penalty_terms_total
 
             self.prob = cp.Problem(objective_expr, constraints)
+            self.objective_expr = objective_expr
+            self.all_constraints = constraints
 
         # Solver Configuration
         solver_opts = {"verbose": False}
@@ -3707,6 +3905,19 @@ class Optimization:
             # 5. Restore Configuration
             self.optim_conf["treat_deferrable_load_as_semi_cont"] = original_semi_cont
             self.optim_conf["set_deferrable_load_single_constant"] = original_single_const
+
+        # Extract shadow prices
+        if not self.optim_conf.get("skip_shadow_price_extraction", False):
+            self.shadow_prices = self._extract_shadow_prices(selected_solver, solver_opts)
+            if self.shadow_prices is not None:
+                self.logger.info(
+                    "Shadow price range: %.3f to %.3f PLN/kWh",
+                    float(np.min(self.shadow_prices)),
+                    float(np.max(self.shadow_prices)),
+                )
+        else:
+            self.shadow_prices = None
+            self.logger.info("Skipping shadow price extraction (skip_shadow_price_extraction=true)")
 
         # Fix for Status Case: Map "optimal" -> "Optimal"
         status_raw = self.prob.status
