@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import re
+import threading
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -52,8 +53,7 @@ emhass_conf: dict[str, Path] = {}
 entity_path: Path = Path()
 params_secrets: dict[str, str | float] = {}
 continual_publish_thread: list = []
-_optimization_action_lock: asyncio.Lock | None = None
-_optimization_action_lock_loop: asyncio.AbstractEventLoop | None = None
+_optimization_action_lock: threading.Lock = threading.Lock()
 injection_dict: dict = {}
 emhass_version: str = "unknown"
 emhass_build_type: str = "unknown"
@@ -68,18 +68,6 @@ action_log_str = "action_logs.txt"
 injection_dict_file = "injection_dict.pkl"
 params_file = "params.pkl"
 error_msg_associations_file = "Unable to obtain associations file"
-
-
-def _get_optimization_action_lock() -> asyncio.Lock:
-    """Return the optimization action lock for the active event loop."""
-    global _optimization_action_lock
-    global _optimization_action_lock_loop
-
-    loop = asyncio.get_running_loop()
-    if _optimization_action_lock is None or _optimization_action_lock_loop is not loop:
-        _optimization_action_lock = asyncio.Lock()
-        _optimization_action_lock_loop = loop
-    return _optimization_action_lock
 
 
 # Add custom filter for trusted HTML content
@@ -706,11 +694,13 @@ async def action_call(action_name: str):
 
     optimization_actions = {"perfect-optim", "dayahead-optim", "naive-mpc-optim"}
     if action_name in optimization_actions:
-        optimization_action_lock = _get_optimization_action_lock()
-        if optimization_action_lock.locked():
+        if _optimization_action_lock.locked():
             app.logger.info("Waiting for current optimization to finish before starting next")
-        async with optimization_action_lock:
+        await asyncio.to_thread(_optimization_action_lock.acquire)
+        try:
             return await _run_action_with_input_data()
+        finally:
+            _optimization_action_lock.release()
 
     return await _run_action_with_input_data()
 
