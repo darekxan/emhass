@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import pathlib
 import pickle
@@ -90,7 +91,15 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/get-config")
         self.assertEqual(response.status_code, 201)
         data = await response.get_json()
-        self.assertEqual(data, {"final": "config"})
+        self.assertEqual(
+            data,
+            {
+                "final": "config",
+                "emhass_version": "unknown",
+                "emhass_build_type": "unknown",
+                "emhass_git_sha": "",
+            },
+        )
 
     @patch("emhass.web_server.build_config")
     @patch("emhass.web_server.build_params")
@@ -153,6 +162,60 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post("/action/perfect-optim", json={})
         self.assertEqual(response.status_code, 201)
         mock_optim.assert_called_once()
+
+    @patch("emhass.web_server.check_file_log", new_callable=AsyncMock)
+    @patch("emhass.web_server.set_input_data_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server.naive_mpc_optim", new_callable=AsyncMock)
+    @patch("emhass.web_server._save_injection_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server.get_injection_dict")
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_naive_mpc_serializes_setup_and_solve(
+        self,
+        mock_load,
+        mock_get_inject,
+        mock_save,
+        mock_optim,
+        mock_set_input,
+        mock_check_log,
+    ):
+        mock_load.return_value = ({"optim_conf": {}}, "profit", "{}")
+        mock_get_inject.return_value = {}
+        mock_check_log.return_value = False
+        first_setup_started = asyncio.Event()
+        release_first_solve = asyncio.Event()
+        setup_calls = 0
+        optim_calls = 0
+
+        async def set_input_side_effect(*args, **kwargs):
+            nonlocal setup_calls
+            setup_calls += 1
+            if setup_calls == 1:
+                first_setup_started.set()
+            return {"retrieve_hass_conf": {"continual_publish": False}}
+
+        async def optim_side_effect(*args, **kwargs):
+            nonlocal optim_calls
+            optim_calls += 1
+            if optim_calls == 1:
+                await release_first_solve.wait()
+            return pd.DataFrame()
+
+        mock_set_input.side_effect = set_input_side_effect
+        mock_optim.side_effect = optim_side_effect
+
+        first_request = asyncio.create_task(self.client.post("/action/naive-mpc-optim", json={}))
+        await first_setup_started.wait()
+
+        second_request = asyncio.create_task(self.client.post("/action/naive-mpc-optim", json={}))
+        await asyncio.sleep(0.05)
+        self.assertEqual(mock_set_input.await_count, 1)
+
+        release_first_solve.set()
+        responses = await asyncio.gather(first_request, second_request)
+
+        self.assertEqual([response.status_code for response in responses], [201, 201])
+        self.assertEqual(mock_set_input.await_count, 2)
+        self.assertEqual(mock_optim.await_count, 2)
 
     @patch("emhass.web_server.export_influxdb_to_csv")
     @patch("emhass.web_server._load_params_and_runtime")

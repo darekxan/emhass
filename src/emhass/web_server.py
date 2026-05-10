@@ -52,7 +52,8 @@ emhass_conf: dict[str, Path] = {}
 entity_path: Path = Path()
 params_secrets: dict[str, str | float] = {}
 continual_publish_thread: list = []
-_current_mpc_task: asyncio.Task | None = None
+_optimization_action_lock: asyncio.Lock | None = None
+_optimization_action_lock_loop: asyncio.AbstractEventLoop | None = None
 injection_dict: dict = {}
 emhass_version: str = "unknown"
 emhass_build_type: str = "unknown"
@@ -67,6 +68,18 @@ action_log_str = "action_logs.txt"
 injection_dict_file = "injection_dict.pkl"
 params_file = "params.pkl"
 error_msg_associations_file = "Unable to obtain associations file"
+
+
+def _get_optimization_action_lock() -> asyncio.Lock:
+    """Return the optimization action lock for the active event loop."""
+    global _optimization_action_lock
+    global _optimization_action_lock_loop
+
+    loop = asyncio.get_running_loop()
+    if _optimization_action_lock is None or _optimization_action_lock_loop is not loop:
+        _optimization_action_lock = asyncio.Lock()
+        _optimization_action_lock_loop = loop
+    return _optimization_action_lock
 
 
 # Add custom filter for trusted HTML content
@@ -537,22 +550,7 @@ async def _handle_action_dispatch(
     if action_name in optim_actions:
         action_str = f" >> Performing {action_name}..."
         logger.info(action_str)
-
-        if action_name == "naive-mpc-optim":
-            global _current_mpc_task
-            if _current_mpc_task is not None and not _current_mpc_task.done():
-                logger.info("Cancelling previous MPC optimization (superseded by new request)")
-                _current_mpc_task.cancel()
-            _current_mpc_task = asyncio.create_task(naive_mpc_optim(input_data_dict, logger))
-            try:
-                opt_res = await _current_mpc_task
-            except asyncio.CancelledError:
-                return "EMHASS >> MPC optimization cancelled by newer request\n", 409
-            finally:
-                if _current_mpc_task is not None and _current_mpc_task.done():
-                    _current_mpc_task = None
-        else:
-            opt_res = await optim_actions[action_name](input_data_dict, logger)
+        opt_res = await optim_actions[action_name](input_data_dict, logger)
 
         injection_dict = get_injection_dict(opt_res)
         await _save_injection_dict(injection_dict, emhass_conf["data_path"])
@@ -664,46 +662,57 @@ async def action_call(action_name: str):
             return await make_response(msg, status)
         return await make_response(await grab_log(action_str), 400)
 
-    # Set Input Data Dict (Common for all other actions)
-    action_str = " >> Setting input data dict"
-    app.logger.info(action_str)
-    input_data_dict = await set_input_data_dict(
-        emhass_conf, costfun, params, runtimeparams, action_name, app.logger
-    )
-
-    if not input_data_dict:
-        return await make_response(await grab_log(action_str), 400)
-
-    # Handle Continual Publish Threading
-    rh_handed_to_thread = False
-    if len(continual_publish_thread) == 0 and input_data_dict["retrieve_hass_conf"].get(
-        "continual_publish", False
-    ):
-        rh_handed_to_thread = True
-        continual_loop = app.add_background_task(
-            continual_publish, input_data_dict, entity_path, app.logger
+    async def _run_action_with_input_data():
+        # Set Input Data Dict (Common for all other actions)
+        action_str = " >> Setting input data dict"
+        app.logger.info(action_str)
+        input_data_dict = await set_input_data_dict(
+            emhass_conf, costfun, params, runtimeparams, action_name, app.logger
         )
-        continual_publish_thread.append(continual_loop)
 
-    # Execute Action
-    try:
-        msg, status = await _handle_action_dispatch(
-            action_name, input_data_dict, emhass_conf, params, runtimeparams, app.logger
-        )
-    finally:
-        # Close HTTP session unless this rh was handed to the continual_publish thread.
-        # Each call to set_input_data_dict creates a fresh rh, so closing here only
-        # affects this request's rh, not any previously started background thread's.
-        if not rh_handed_to_thread and "rh" in input_data_dict:
-            await input_data_dict["rh"].close()
+        if not input_data_dict:
+            return await make_response(await grab_log(action_str), 400)
 
-    # Final Log Check & Response
-    if status == 201:
-        if not await check_file_log(" >> "):
-            return await make_response(msg, 201)
-        return await make_response(await grab_log(" >> "), 400)
+        # Handle Continual Publish Threading
+        rh_handed_to_thread = False
+        if len(continual_publish_thread) == 0 and input_data_dict["retrieve_hass_conf"].get(
+            "continual_publish", False
+        ):
+            rh_handed_to_thread = True
+            continual_loop = app.add_background_task(
+                continual_publish, input_data_dict, entity_path, app.logger
+            )
+            continual_publish_thread.append(continual_loop)
 
-    return await make_response(msg, status)
+        # Execute Action
+        try:
+            msg, status = await _handle_action_dispatch(
+                action_name, input_data_dict, emhass_conf, params, runtimeparams, app.logger
+            )
+        finally:
+            # Close HTTP session unless this rh was handed to the continual_publish thread.
+            # Each call to set_input_data_dict creates a fresh rh, so closing here only
+            # affects this request's rh, not any previously started background thread's.
+            if not rh_handed_to_thread and "rh" in input_data_dict:
+                await input_data_dict["rh"].close()
+
+        # Final Log Check & Response
+        if status == 201:
+            if not await check_file_log(" >> "):
+                return await make_response(msg, 201)
+            return await make_response(await grab_log(" >> "), 400)
+
+        return await make_response(msg, status)
+
+    optimization_actions = {"perfect-optim", "dayahead-optim", "naive-mpc-optim"}
+    if action_name in optimization_actions:
+        optimization_action_lock = _get_optimization_action_lock()
+        if optimization_action_lock.locked():
+            app.logger.info("Waiting for current optimization to finish before starting next")
+        async with optimization_action_lock:
+            return await _run_action_with_input_data()
+
+    return await _run_action_with_input_data()
 
 
 async def _setup_paths() -> tuple[Path, Path, Path, Path, Path, Path]:
